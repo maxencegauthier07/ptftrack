@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { supabase } from "@/lib/supabase";
-import type { Goal, VelocityWindow } from "@/lib/types";
-import { Target, Pencil, X, Check, TrendingUp, Calendar, Sparkles, Plus, ChevronDown, ChevronUp } from "lucide-react";
+import type { Goal, VelocityWindow, CashMovement } from "@/lib/types";
+import { Target, Pencil, X, Check, TrendingUp, Calendar, Sparkles, Plus, ChevronDown, ChevronUp, Wallet } from "lucide-react";
 
 const fmt = (n: number | null | undefined, d = 0) =>
   n == null ? "—" : Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -15,7 +15,6 @@ const daysBetween = (a: string, b: string) => {
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
-// Référence figée pour la progression (coïncide avec le backfill)
 const REF_DATE = "2025-12-31";
 
 type NwSnapshot = { date: string; net: number };
@@ -24,6 +23,7 @@ type Props = {
   personId: string;
   currentNet: number;
   snapshots: NwSnapshot[];
+  cashMovements: CashMovement[];
   onNotify?: (m: string) => void;
 };
 
@@ -35,7 +35,7 @@ const VELOCITY_LABELS: Record<VelocityWindow, string> = {
   "since_ref": "Depuis 31/12/25",
 };
 
-export default function GoalCard({ personId, currentNet, snapshots, onNotify }: Props) {
+export default function GoalCard({ personId, currentNet, snapshots, cashMovements, onNotify }: Props) {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState<"new" | "edit" | null>(null);
@@ -52,7 +52,6 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
 
   useEffect(() => { load(); }, [load]);
 
-  // Détection "atteint" pour chaque goal
   useEffect(() => {
     (async () => {
       for (const g of goals) {
@@ -69,9 +68,7 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
 
   const openNew = () => {
     setEditForm({
-      name: "",
-      target_amount: "",
-      target_date: "",
+      name: "", target_amount: "", target_date: "",
       velocity_window: "30d" as VelocityWindow,
     });
     setModal("new");
@@ -79,8 +76,7 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
 
   const openEdit = (g: Goal) => {
     setEditForm({
-      id: g.id,
-      name: g.name,
+      id: g.id, name: g.name,
       target_amount: String(g.target_amount),
       target_date: g.target_date || "",
       velocity_window: g.velocity_window || "30d",
@@ -93,10 +89,8 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
     if (!target || target <= 0) return;
 
     try {
-      // Calcul du start_amount depuis le snapshot fin 2025 si dispo
-      const refSnapshot = snapshots.find(s => s.date <= REF_DATE && s.date >= "2025-12-20")
-        || snapshots[0];
-      const startAmount = refSnapshot ? Number(refSnapshot.net) : currentNet;
+      const refSnapshot = [...snapshots].reverse().find(s => s.date <= REF_DATE);
+      const startAmount = refSnapshot ? Number(refSnapshot.net) : 0;
 
       if (modal === "edit" && editForm.id) {
         await supabase.from("goals").update({
@@ -150,7 +144,6 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
 
   if (loading) return null;
 
-  // Pas de goal : CTA unique
   if (goals.length === 0) {
     return (
       <>
@@ -161,7 +154,7 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
             </div>
             <div>
               <div className="text-[var(--text-1)] text-sm font-semibold mb-1">Fixe-toi des objectifs</div>
-              <div className="text-[var(--text-3)] text-xs">Court terme, long terme, FIRE... plusieurs objectifs en parallèle</div>
+              <div className="text-[var(--text-3)] text-xs">Court terme, long terme... plusieurs objectifs en parallèle</div>
             </div>
             <button onClick={openNew} className="btn btn-primary">
               <Plus size={12} /> Nouvel objectif
@@ -176,7 +169,6 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
     );
   }
 
-  // Multi-goals affichage
   return (
     <>
       <div className="mb-6">
@@ -199,6 +191,7 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
               goal={g}
               currentNet={currentNet}
               snapshots={snapshots}
+              cashMovements={cashMovements}
               canMoveUp={idx > 0}
               canMoveDown={idx < goals.length - 1}
               onEdit={() => openEdit(g)}
@@ -222,11 +215,12 @@ export default function GoalCard({ personId, currentNet, snapshots, onNotify }: 
    ───────────────────────────────────────────────────────── */
 
 function SingleGoal({
-  goal, currentNet, snapshots,
+  goal, currentNet, snapshots, cashMovements,
   canMoveUp, canMoveDown,
   onEdit, onArchive, onMoveUp, onMoveDown,
 }: {
   goal: Goal; currentNet: number; snapshots: NwSnapshot[];
+  cashMovements: CashMovement[];
   canMoveUp: boolean; canMoveDown: boolean;
   onEdit: () => void; onArchive: () => void;
   onMoveUp: () => void; onMoveDown: () => void;
@@ -236,15 +230,13 @@ function SingleGoal({
   const startDate = goal.start_date || REF_DATE;
   const achieved = !!goal.achieved_at;
 
-  // Progression absolue depuis la ref (fin 2025)
   const progressAbs = currentNet - startAmount;
   const targetAbs = target - startAmount;
   const progressPct = targetAbs > 0
     ? Math.max(0, Math.min(100, (progressAbs / targetAbs) * 100))
     : 0;
 
-  // ★ Taux de croissance mensuel COMPOSÉ (pas linéaire en €)
-  //   Formule : (NW_fin / NW_début)^(1/nb_mois) - 1
+  // ★ Taux mensuel COMPOSÉ — perf PURE (hors apports)
   const monthlyRate = useMemo(() => {
     if (snapshots.length < 2) return 0;
 
@@ -262,41 +254,41 @@ function SingleGoal({
       windowStart = d.toISOString().slice(0, 10);
     }
 
-    // Premier snapshot dans la fenêtre (ou fallback sur tous)
-    let inWindow = snapshots.filter(s => s.date >= windowStart);
-    if (inWindow.length < 2) inWindow = snapshots;
-    if (inWindow.length < 2) return 0;
+    const inWindow = snapshots.filter(s => s.date >= windowStart);
+    const series = inWindow.length >= 2 ? inWindow : snapshots;
+    if (series.length < 2) return 0;
 
-    const first = inWindow[0];
-    const last = inWindow[inWindow.length - 1];
+    const first = series[0];
+    const last = series[series.length - 1];
     const startVal = Number(first.net);
     const endVal = Number(last.net);
-    // Si NW de départ <= 0 ou < 1 € -> compound impossible
     if (startVal <= 1) return 0;
 
-    const days = Math.max(1, daysBetween(first.date, last.date));
-    const months = days / 30.4375;   // jours moyens par mois
-    const ratio = endVal / startVal;
+    // ★ Soustrait les apports nets de la période pour avoir la perf "pure"
+    const netContributions = cashMovements
+      .filter(cm => cm.date >= first.date && cm.date <= last.date)
+      .reduce((s, cm) => s + Number(cm.amount), 0);
+
+    const endValPure = endVal - netContributions;
+    if (endValPure <= 0) return 0;
+
+    const ratio = endValPure / startVal;
     if (ratio <= 0) return 0;
 
-    return Math.pow(ratio, 1 / months) - 1;
-  }, [snapshots, goal.velocity_window]);
+    const days = Math.max(1, daysBetween(first.date, last.date));
+    const months = days / 30.4375;
 
-  // Projection — à taux composé
+    return Math.pow(ratio, 1 / months) - 1;
+  }, [snapshots, goal.velocity_window, cashMovements]);
+
+  // Projection à taux composé (sans apport supplémentaire)
   const projection = useMemo(() => {
-    const remaining = Math.max(0, target - currentNet);
     if (currentNet >= target) {
-      return {
-        projectedDate: goal.achieved_at?.slice(0, 10) || todayStr(),
-        daysLeft: 0,
-        monthlyEurEstimate: null as number | null,
-      };
+      return { projectedDate: goal.achieved_at?.slice(0, 10) || todayStr(), daysLeft: 0, monthlyEurEstimate: null as number | null };
     }
     if (monthlyRate <= 0 || currentNet <= 0) {
       return { projectedDate: null, daysLeft: null, monthlyEurEstimate: null };
     }
-    // NW(n) = NW_current × (1+r)^n = target
-    // n = log(target/NW_current) / log(1+r)  en mois
     const monthsNeeded = Math.log(target / currentNet) / Math.log(1 + monthlyRate);
     if (!isFinite(monthsNeeded) || monthsNeeded <= 0) {
       return { projectedDate: null, daysLeft: null, monthlyEurEstimate: null };
@@ -304,18 +296,39 @@ function SingleGoal({
     const daysLeft = Math.ceil(monthsNeeded * 30.4375);
     const d = new Date();
     d.setDate(d.getDate() + daysLeft);
-
-    // Gain estimé le mois prochain (pour affichage "+ X€/mois au rythme actuel")
-    const monthlyEurEstimate = currentNet * monthlyRate;
-
     return {
       projectedDate: d.toISOString().slice(0, 10),
       daysLeft,
-      monthlyEurEstimate,
+      monthlyEurEstimate: currentNet * monthlyRate,
     };
   }, [target, currentNet, monthlyRate, goal.achieved_at]);
 
-  // On-track vs target_date
+  // ★ Apport mensuel REQUIS pour atteindre la cible à target_date, compte tenu de la perf
+  const requiredContribution = useMemo(() => {
+    if (!goal.target_date) return null;
+    if (currentNet >= target) return null;
+
+    const daysLeft = daysBetween(todayStr(), goal.target_date);
+    if (daysLeft <= 0) return null;
+
+    const monthsLeft = Math.max(1, daysLeft / 30.4375);
+    const r = monthlyRate;
+    const PV = currentNet;
+    const FV = target;
+    const n = monthsLeft;
+
+    // Cas : pas de perf mesurable → apport linéaire pur
+    if (r <= 0) {
+      return { pmt: (FV - PV) / n, withNoGrowth: true };
+    }
+
+    // Formule annuité : PMT = [FV - PV(1+r)^n] × r / [(1+r)^n - 1]
+    const growthFactor = Math.pow(1 + r, n);
+    const pmt = (FV - PV * growthFactor) * r / (growthFactor - 1);
+
+    return { pmt, withNoGrowth: false };
+  }, [goal.target_date, target, currentNet, monthlyRate]);
+
   const trackStatus = useMemo(() => {
     if (!goal.target_date || projection.daysLeft == null) return null;
     const targetDays = daysBetween(todayStr(), goal.target_date);
@@ -347,30 +360,20 @@ function SingleGoal({
 
         <div className="flex items-center gap-0.5 shrink-0">
           {canMoveUp && (
-            <button onClick={onMoveUp} className="text-[var(--text-3)] hover:text-[var(--text-1)] p-1" title="Monter">
-              <ChevronUp size={11} />
-            </button>
+            <button onClick={onMoveUp} className="text-[var(--text-3)] hover:text-[var(--text-1)] p-1" title="Monter"><ChevronUp size={11} /></button>
           )}
           {canMoveDown && (
-            <button onClick={onMoveDown} className="text-[var(--text-3)] hover:text-[var(--text-1)] p-1" title="Descendre">
-              <ChevronDown size={11} />
-            </button>
+            <button onClick={onMoveDown} className="text-[var(--text-3)] hover:text-[var(--text-1)] p-1" title="Descendre"><ChevronDown size={11} /></button>
           )}
-          <button onClick={onEdit} className="text-[var(--text-3)] hover:text-[var(--text-1)] p-1" title="Modifier">
-            <Pencil size={11} />
-          </button>
-          <button onClick={onArchive} className="text-[var(--text-3)] hover:text-[var(--red)] p-1" title="Archiver">
-            <X size={11} />
-          </button>
+          <button onClick={onEdit} className="text-[var(--text-3)] hover:text-[var(--text-1)] p-1" title="Modifier"><Pencil size={11} /></button>
+          <button onClick={onArchive} className="text-[var(--text-3)] hover:text-[var(--red)] p-1" title="Archiver"><X size={11} /></button>
         </div>
       </div>
 
       {/* Progress */}
       <div className="mb-2">
         <div className="flex justify-between items-baseline mb-1.5">
-          <span className="text-[var(--text-1)] font-mono text-base font-semibold">
-            {fmt(progressPct, 1)}%
-          </span>
+          <span className="text-[var(--text-1)] font-mono text-base font-semibold">{fmt(progressPct, 1)}%</span>
           {!achieved && (
             <span className="text-[var(--text-3)] text-[10px] font-mono">
               {fmt(currentNet, 0)} / {fmt(target, 0)}€
@@ -378,10 +381,8 @@ function SingleGoal({
           )}
         </div>
         <div className="h-1.5 bg-[var(--bg-overlay)] rounded-full overflow-hidden">
-          <div
-            className="h-full rounded-full transition-all duration-500"
-            style={{ width: `${Math.min(100, progressPct)}%`, background: barColor }}
-          />
+          <div className="h-full rounded-full transition-all duration-500"
+            style={{ width: `${Math.min(100, progressPct)}%`, background: barColor }} />
         </div>
         <div className="text-[9px] text-[var(--text-4)] font-mono mt-1">
           Depuis {startDate} · +{fmt(progressAbs, 0)}€
@@ -400,21 +401,10 @@ function SingleGoal({
               <div className="flex items-center gap-1.5 text-[var(--text-3)]">
                 <TrendingUp size={10} />
                 <span>
-                  <span className="text-[var(--text-2)]">
-                    +{fmt(monthlyRate * 100, 2)}%/mois
-                  </span>
-                  <span className="text-[var(--text-4)] ml-1">
-                    · {fmt((Math.pow(1 + monthlyRate, 12) - 1) * 100, 1)}%/an
-                  </span>
+                  <span className="text-[var(--text-2)]">+{fmt(monthlyRate * 100, 2)}%/mois</span>
+                  <span className="text-[var(--text-4)] ml-1">· {fmt((Math.pow(1 + monthlyRate, 12) - 1) * 100, 1)}%/an</span>
                 </span>
               </div>
-              {projection.monthlyEurEstimate && (
-                <div className="flex items-center gap-1.5 text-[var(--text-4)] pl-[14px]">
-                  <span>
-                    ≈ +{fmt(projection.monthlyEurEstimate, 0)}€ ce mois au rythme actuel
-                  </span>
-                </div>
-              )}
               {projection.projectedDate && (
                 <div className="flex items-center gap-1.5 text-[var(--text-3)]">
                   <Calendar size={10} />
@@ -422,9 +412,7 @@ function SingleGoal({
                     <span className="text-[var(--text-2)]">
                       {new Date(projection.projectedDate).toLocaleDateString("fr-FR", { month: "short", year: "numeric" })}
                     </span>
-                    <span className="text-[var(--text-4)] ml-1">
-                      ({projection.daysLeft} j · {VELOCITY_LABELS[goal.velocity_window || "30d"]})
-                    </span>
+                    <span className="text-[var(--text-4)] ml-1">sans apport · {VELOCITY_LABELS[goal.velocity_window || "30d"]}</span>
                   </span>
                 </div>
               )}
@@ -445,6 +433,28 @@ function SingleGoal({
               Pas de croissance positive sur {VELOCITY_LABELS[goal.velocity_window || "30d"]}
             </div>
           )}
+
+          {/* ★ APPORT MENSUEL REQUIS */}
+          {requiredContribution && (
+            <div className="flex items-center gap-1.5 pt-1.5 border-t border-[var(--border)] mt-1.5">
+              <Wallet size={10} className="text-[var(--accent)]" />
+              {requiredContribution.pmt <= 0 ? (
+                <span className="text-[var(--green)] font-medium">
+                  Perf suffisante — pas d&apos;apport nécessaire
+                </span>
+              ) : (
+                <span className="text-[var(--text-3)]">
+                  Apport requis :{" "}
+                  <span className="text-[var(--text-1)] font-semibold">
+                    {fmt(requiredContribution.pmt, 0)}€/mois
+                  </span>
+                  {requiredContribution.withNoGrowth && (
+                    <span className="text-[var(--text-4)] ml-1">(sans perf)</span>
+                  )}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -452,16 +462,16 @@ function SingleGoal({
 }
 
 /* ─────────────────────────────────────────────────────────
-   MODAL DE CRÉATION / ÉDITION
+   MODAL
    ───────────────────────────────────────────────────────── */
 
 function GoalModal({ form, setForm, onClose, onSave, currentNet, isEdit }: any) {
   const windows: { value: VelocityWindow; label: string; hint: string }[] = [
-    { value: "30d",       label: "30 jours",      hint: "Rythme récent (réactif)" },
-    { value: "90d",       label: "3 mois",        hint: "Tendance trimestrielle" },
-    { value: "180d",      label: "6 mois",        hint: "Moyen terme lissé" },
-    { value: "ytd",       label: "YTD",           hint: "Depuis le 1er janvier" },
-    { value: "since_ref", label: "Depuis 31/12/25", hint: "Depuis la référence (fiable long terme)" },
+    { value: "30d",       label: "30 jours",         hint: "Rythme récent (réactif)" },
+    { value: "90d",       label: "3 mois",           hint: "Tendance trimestrielle" },
+    { value: "180d",      label: "6 mois",           hint: "Moyen terme lissé" },
+    { value: "ytd",       label: "YTD",              hint: "Depuis le 1er janvier" },
+    { value: "since_ref", label: "Depuis 31/12/25",  hint: "Fiable long terme" },
   ];
 
   return (
@@ -477,7 +487,7 @@ function GoalModal({ form, setForm, onClose, onSave, currentNet, isEdit }: any) 
         <div className="mb-3">
           <label className="block text-[var(--text-3)] text-[10px] mb-1 uppercase tracking-wider">Nom *</label>
           <input value={form.name || ""} onChange={e => setForm({ ...form, name: e.target.value })}
-            placeholder="FIRE 2035, Objectif 200k fin d'année..." className="input" />
+            placeholder="Objectif 200k fin d'année..." className="input" />
         </div>
 
         <div className="mb-3">
@@ -497,6 +507,9 @@ function GoalModal({ form, setForm, onClose, onSave, currentNet, isEdit }: any) 
           <input type="date" value={form.target_date || ""}
             onChange={e => setForm({ ...form, target_date: e.target.value })}
             className="input" />
+          <div className="text-[10px] text-[var(--text-4)] mt-1">
+            Nécessaire pour calculer l&apos;apport mensuel requis
+          </div>
         </div>
 
         <div className="mb-5">
@@ -521,15 +534,13 @@ function GoalModal({ form, setForm, onClose, onSave, currentNet, isEdit }: any) 
               </label>
             ))}
           </div>
-          <div className="text-[10px] text-[var(--text-4)] mt-2">
-            Utilisé pour calculer la projection de date d&apos;atteinte
-          </div>
         </div>
 
         <div className="bg-[var(--bg-overlay)] rounded-md p-3 mb-4 text-[10px] text-[var(--text-3)] font-mono leading-relaxed">
-          <span className="text-[var(--text-2)]">Référence de progression :</span> figée au 31/12/2025
-          <br />
-          <span className="text-[var(--text-4)]">La barre de progression = écart entre ton NW de fin 2025 et ta cible</span>
+          <div className="text-[var(--text-2)] mb-1">Fonctionnement</div>
+          <div>• <span className="text-[var(--text-2)]">Base fixe</span> : ton NW du 31/12/2025 (point de référence)</div>
+          <div>• <span className="text-[var(--text-2)]">Perf</span> : calculée HORS apports sur la fenêtre choisie</div>
+          <div>• <span className="text-[var(--text-2)]">Apport requis</span> : complément mensuel à mettre pour atteindre la cible à la date</div>
         </div>
 
         <button onClick={onSave} disabled={!form.target_amount || !form.name}

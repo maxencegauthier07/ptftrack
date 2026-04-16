@@ -7,7 +7,7 @@ import {
 } from "recharts";
 import { supabase } from "@/lib/supabase";
 import type {
-  Account, SubAccount, Holding, BankAccount, Property, Loan, FxRate,
+  Account, SubAccount, Holding, BankAccount, Property, Loan, FxRate, CashMovement,
 } from "@/lib/types";
 import { TrendingUp, Landmark, Home, CreditCard, ArrowUpRight, ArrowDownRight } from "lucide-react";
 import Sparkline from "./Sparkline";
@@ -16,7 +16,6 @@ import DividendsTracker from "./DividendsTracker";
 
 const fmt = (n: number | null | undefined, d = 0) =>
   n == null ? "—" : Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
-
 const fmtSign = (n: number, d = 0) => (n >= 0 ? "+" : "") + fmt(n, d);
 
 type NwSnapshot = {
@@ -57,6 +56,7 @@ export default function NetWorthView({ personId }: { personId: string }) {
   const [loans, setLoans] = useState<Loan[]>([]);
   const [fxRates, setFxRates] = useState<FxRate[]>([]);
   const [snapshots, setSnapshots] = useState<NwSnapshot[]>([]);
+  const [cashMovements, setCashMovements] = useState<CashMovement[]>([]);
   const [period, setPeriod] = useState("1M");
 
   const notify = (m: string) => { setToast(m); setTimeout(() => setToast(null), 2500); };
@@ -66,7 +66,7 @@ export default function NetWorthView({ personId }: { personId: string }) {
     const { data: accs } = await supabase.from("accounts").select("*").eq("person_id", personId);
     const accIds = (accs || []).map(a => a.id);
 
-    const [saR, hR, bR, pR, lR, fxR, nwR] = await Promise.all([
+    const [saR, hR, bR, pR, lR, fxR, nwR, cmR] = await Promise.all([
       accIds.length
         ? supabase.from("sub_accounts").select("*").in("account_id", accIds)
         : Promise.resolve({ data: [] as any }),
@@ -77,6 +77,9 @@ export default function NetWorthView({ personId }: { personId: string }) {
       supabase.from("fx_rates").select("*").order("date", { ascending: false }).limit(50),
       supabase.from("networth_snapshots").select("*").eq("person_id", personId)
         .eq("currency", "EUR").order("date", { ascending: true }).limit(2000),
+      accIds.length
+        ? supabase.from("cash_movements").select("*").in("account_id", accIds)
+        : Promise.resolve({ data: [] as any }),
     ]);
 
     setAccounts((accs || []) as Account[]);
@@ -87,6 +90,7 @@ export default function NetWorthView({ personId }: { personId: string }) {
     setLoans((lR.data || []) as Loan[]);
     setFxRates((fxR.data || []) as FxRate[]);
     setSnapshots((nwR.data || []) as NwSnapshot[]);
+    setCashMovements((cmR.data || []) as CashMovement[]);
     setLoading(false);
   }, [personId]);
 
@@ -110,7 +114,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
       if (!result[ccy]) result[ccy] = { ccy, stocks: 0, bank: 0, realEstate: 0, loans: 0, net: 0 };
       result[ccy][field] += v;
     };
-
     for (const sa of subAccounts) {
       const acc = accounts.find(a => a.id === sa.account_id);
       if (!acc) continue;
@@ -124,7 +127,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
       bump(p.currency, "realEstate", Number(p.current_value || 0) * (Number(p.ownership_pct || 100) / 100));
     }
     for (const l of loans) bump(l.currency, "loans", Number(l.current_balance || 0));
-
     for (const r of Object.values(result)) {
       r.net = r.stocks + r.bank + r.realEstate - r.loans;
     }
@@ -189,13 +191,11 @@ export default function NetWorthView({ personId }: { personId: string }) {
     const last = snapshots[snapshots.length - 1];
     const prev = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
     const periodStart = chartData[0];
-
     const dayDelta = prev ? Number(last.net) - Number(prev.net) : null;
     const periodDelta = periodStart ? Number(last.net) - Number(periodStart.net) : null;
     const periodDeltaPct = periodStart && Number(periodStart.net) !== 0
       ? (periodDelta! / Number(periodStart.net)) * 100
       : null;
-
     return { dayDelta, periodDelta, periodDeltaPct, lastDate: last.date };
   }, [snapshots, chartData]);
 
@@ -208,7 +208,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
   return (
     <div className="px-5 py-6 max-w-[1280px] mx-auto">
       {toast && <div className="fixed top-3 right-3 z-50 bg-[var(--green)] text-white py-2 px-4 rounded-md text-xs font-mono animate-fade-up shadow-lg">{toast}</div>}
-
       {isEmpty ? (
         <div className="card-static py-24 text-center">
           <div className="text-[var(--text-2)] text-sm mb-1">Rien à afficher pour l&apos;instant</div>
@@ -223,7 +222,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
               <div className="font-mono font-semibold tracking-tight text-[var(--text-1)]" style={{ fontSize: "44px", lineHeight: 1.1 }}>
                 {fmt(grandTotalEur, 0)}<span className="text-[var(--text-3)] text-2xl ml-1.5 font-normal">€</span>
               </div>
-
               {variations?.dayDelta != null && (
                 <div className="inline-flex items-center gap-1.5 text-sm font-mono">
                   {variations.dayDelta >= 0 ? (
@@ -238,7 +236,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
                 </div>
               )}
             </div>
-
             {variations?.periodDelta != null && period !== "ALL" && (
               <div className="text-xs text-[var(--text-3)] font-mono">
                 <span style={{ color: variations.periodDelta >= 0 ? "var(--green)" : "var(--red)" }} className="font-semibold">
@@ -254,11 +251,12 @@ export default function NetWorthView({ personId }: { personId: string }) {
             )}
           </div>
 
-          {/* ★ GOAL CARD */}
+          {/* ★ GOAL CARD — reçoit maintenant les cashMovements pour calculer la perf pure */}
           <GoalCard
             personId={personId}
             currentNet={grandTotalEur}
             snapshots={snapshots}
+            cashMovements={cashMovements}
             onNotify={notify}
           />
 
@@ -278,7 +276,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
                 ))}
               </div>
             </div>
-
             {chartData.length === 0 ? (
               <div className="py-16 text-center text-[var(--text-3)] text-xs font-mono">
                 Pas encore de snapshot. Lance un update sur l&apos;onglet Stocks pour générer le premier.
@@ -449,7 +446,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
 
 function CategoryCard({ label, value, color, icon: Ico, series, isDebt }: any) {
   const displayValue = isDebt ? -value : value;
-
   const trend = useMemo(() => {
     if (!series || series.length < 2) return null;
     const first = series[0];
@@ -460,9 +456,7 @@ function CategoryCard({ label, value, color, icon: Ico, series, isDebt }: any) {
     const isGood = isDebt ? delta < 0 : delta > 0;
     return { delta, pct, isGood };
   }, [series, isDebt]);
-
   const trendColor = trend?.isGood ? "var(--green)" : "var(--red)";
-
   return (
     <div className="card-static p-4 relative overflow-hidden">
       <div className="flex items-center justify-between mb-3">
@@ -472,7 +466,6 @@ function CategoryCard({ label, value, color, icon: Ico, series, isDebt }: any) {
       <div className="font-mono font-semibold tracking-tight text-[var(--text-1)]" style={{ fontSize: "20px" }}>
         {fmtSign(displayValue, 0)}<span className="text-[var(--text-3)] text-xs ml-1 font-normal">€</span>
       </div>
-
       <div className="flex items-center justify-between mt-2 gap-2">
         {trend ? (
           <span className="text-[10px] font-mono" style={{ color: trendColor }}>
