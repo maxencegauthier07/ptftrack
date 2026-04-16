@@ -1,0 +1,238 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap");
+
+:root {
+  color-scheme: dark;
+  /* ─── Backgrounds ─── */
+  --bg:           #06080c;            /* fond principal (gardé noir profond) */
+  --bg-raised:   #0c0f15;             /* cards : un cran au-dessus du fond, plus doux que le pur noir */
+  --bg-overlay:  #11151c;             /* hover, inputs, sub-cards */
+  --bg-subtle:   #0a0d12;             /* zones secondaires */
+
+  /* ─── Borders ─── */
+  --border:      rgba(255,255,255,0.06);   /* subtil, presque invisible — Linear-style */
+  --border-2:    rgba(255,255,255,0.10);   /* hover */
+  --border-3:    rgba(255,255,255,0.14);   /* emphase */
+
+  /* ─── Text (hiérarchie nette : 4 niveaux) ─── */
+  --text-1:      #e8eaed;             /* titres, chiffres importants */
+  --text-2:      #b4b8c0;             /* texte secondaire */
+  --text-3:      #6b7180;             /* labels, hints */
+  --text-4:      #3d4148;             /* dim, désactivé */
+
+  /* ─── Accents ─── */
+  --accent:      #6e8eff;             /* bleu Linear, plus doux que #58a6ff */
+  --accent-bg:   rgba(110,142,255,0.10);
+  --green:       #4ade80;
+  --green-bg:    rgba(74,222,128,0.10);
+  --red:         #f87171;
+  --red-bg:      rgba(248,113,113,0.10);
+  --amber:       #fbbf24;
+  --amber-bg:    rgba(251,191,36,0.10);
+
+  /* ─── Catégories Net Worth ─── */
+  --cat-stocks:    #6e8eff;
+  --cat-bank:      #4ade80;
+  --cat-realestate:#fbbf24;
+  --cat-loans:     #f87171;
+  --cat-crypto:    #c084fc;
+
+  /* ─── Layout ─── */
+  --radius-sm:   6px;
+  --radius:      8px;
+  --radius-lg:   12px;
+  --radius-xl:   16px;
+
+  /* ─── Typography ─── */
+  --font-sans:  'Inter', -apple-system, system-ui, sans-serif;
+  --font-mono:  'Geist Mono', ui-monospace, monospace;
+}
+
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';  /* Inter tweaks */
+}
+
+/* Scrollbar discret */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.08);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.15);
+}
+
+/* ─── Animations ─── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up { animation: fadeUp 0.18s ease-out; }
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.animate-fade-in { animation: fadeIn 0.15s ease-out; }
+
+@keyframes flashGreen {
+  0% { background: var(--green-bg); }
+  100% { background: transparent; }
+}
+.flash-green { animation: flashGreen 0.8s ease-out; }
+
+@keyframes flashRed {
+  0% { background: var(--red-bg); }
+  100% { background: transparent; }
+}
+.flash-red { animation: flashRed 0.8s ease-out; }
+
+/* ─── Row hover discret ─── */
+.row-hover {
+  transition: background 0.12s ease;
+}
+.row-hover:hover {
+  background: var(--bg-overlay);
+}
+
+/* ─── Cards : style Linear ─── */
+.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  transition: border-color 0.12s ease;
+}
+.card:hover { border-color: var(--border-2); }
+
+.card-static {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+/* ─── Buttons ─── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 13px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--radius);
+  transition: all 0.12s ease;
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-family: var(--font-sans);
+}
+.btn-primary {
+  background: var(--accent);
+  color: white;
+}
+.btn-primary:hover { background: #5a7aff; }
+.btn-ghost {
+  background: transparent;
+  color: var(--text-2);
+  border-color: var(--border);
+}
+.btn-ghost:hover {
+  color: var(--text-1);
+  border-color: var(--border-2);
+  background: var(--bg-overlay);
+}
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+
+/* ─── Inputs ─── */
+.input {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-1);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color 0.12s;
+}
+.input:focus { border-color: var(--accent); }
+.input::placeholder { color: var(--text-4); }
+
+/* ─── Editable number (quick-edit) ─── */
+.editable {
+  cursor: text;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  transition: background 0.1s;
+}
+.editable:hover {
+  background: var(--bg-overlay);
+}
+.editable:focus,
+.editable.editing {
+  background: var(--bg-overlay);
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+}
+
+/* ─── Skeleton ─── */
+@keyframes shimmer {
+  0% { background-position: -1000px 0; }
+  100% { background-position: 1000px 0; }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-overlay) 0%,
+    var(--bg-subtle) 50%,
+    var(--bg-overlay) 100%
+  );
+  background-size: 1000px 100%;
+  animation: shimmer 2s infinite linear;
+  border-radius: var(--radius);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MODE LECTURE SEULE
+   ═══════════════════════════════════════════════════════════════
+   Quand un parent a la classe .ptf-ro, on grise et désactive
+   tous les boutons et inputs non whitelistés.
+   - Les tabs de navigation [data-nav="true"] restent actifs
+   - Les boutons [data-keep-active] restent actifs (période, filtres...)
+   - Les boutons [role="tablist"] button restent actifs
+*/
+
+.ptf-ro button:not([data-nav]):not([data-keep-active]):not([role="tab"]),
+.ptf-ro input:not([data-keep-active]),
+.ptf-ro select:not([data-keep-active]),
+.ptf-ro textarea:not([data-keep-active]) {
+  opacity: 0.4 !important;
+  pointer-events: none !important;
+  cursor: not-allowed !important;
+  user-select: none;
+}
+
+/* Les filtres / tabs / sélecteurs de période restent cliquables */
+.ptf-ro [role="tablist"] button,
+.ptf-ro [role="tab"],
+.ptf-ro button[data-tab="true"],
+.ptf-ro button[data-keep-active="true"] {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  cursor: pointer !important;
+}
+
+/* Les inputs de type "radio" dans les filtres / formulaires non-éditables
+   restent visibles mais inactifs, c'est voulu */
