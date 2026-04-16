@@ -22,8 +22,9 @@ export default function LoginPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Erreur");
-      router.push("/");
-      router.refresh();
+      // ★ Full reload au lieu de router.push : force UserProvider à s'initialiser
+      // avec le cookie de session fraîchement posé, avant que les composants ne se montent
+      window.location.href = "/";
     } catch (e: any) {
       setErr(e.message);
     } finally {
