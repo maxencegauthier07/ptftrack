@@ -351,9 +351,11 @@ export default function StocksDashboard({ personId }: { personId: string }) {
   }), [subAccounts, accounts]);
 
   /* ─── Actions ────────────────────────────────── */
-  const recalc = async (date: string) => {
-    await fetch(`/api/update?force=true&date=${date}`);
-  };
+    const recalc = async (date: string, accountId?: string | null) => {
+    const params = new URLSearchParams({ force: "true", date });
+    if (accountId) params.set("account_id", accountId);
+    await fetch(`/api/update?${params.toString()}`);
+    };
 
   // Récupère l'account_id à partir d'un sub_account_id
   const subAccToAccId = (saId: string): string | null => {
@@ -392,7 +394,7 @@ export default function StocksDashboard({ personId }: { personId: string }) {
       }).eq("id", accId);
 
       notify("✓ Cash — recalcul..."); setModal(null);
-      await recalc(form.date); load();
+      await recalc(form.date, accId); load();
     } catch (e: any) { setErr(e.message); }
   };
 
@@ -464,7 +466,7 @@ export default function StocksDashboard({ personId }: { personId: string }) {
       }
 
       setModal(null);
-      await recalc(form.date); load();
+      await recalc(form.date, accId); load();
     } catch (e: any) { setErr(e.message); }
   };
 
@@ -574,7 +576,7 @@ export default function StocksDashboard({ personId }: { personId: string }) {
 
       notify(`✓ ${form.side} ${form.ticker.toUpperCase()} — recalcul...`);
       setModal(null);
-      await recalc(form.date); load();
+      await recalc(form.date, accId); load();
     } catch (e: any) { setErr(e.message); }
   };
 
@@ -595,7 +597,7 @@ export default function StocksDashboard({ personId }: { personId: string }) {
     }).eq("id", item.account_id);
     await supabase.from("cash_movements").delete().eq("id", item.id);
     notify("✓ Mouvement annulé — recalcul...");
-    await recalc(item.date); load();
+    await recalc(item.date, item.account_id); load();
   };
 
   const delRealizedPnl = async (item: RealizedPnl) => {
@@ -613,7 +615,7 @@ export default function StocksDashboard({ personId }: { personId: string }) {
     }).eq("id", item.account_id);
     await supabase.from("realized_pnl").delete().eq("id", item.id);
     notify("✓ P&L annulé — recalcul...");
-    await recalc(item.date); load();
+    await recalc(item.date, item.account_id); load();
   };
 
   const delTrade = async (item: Trade) => {
@@ -643,7 +645,7 @@ export default function StocksDashboard({ personId }: { personId: string }) {
 
     await supabase.from("trades").delete().eq("id", item.id);
     notify("✓ Trade annulé — recalcul...");
-    await recalc(item.date); load();
+    await recalc(item.date, item.account_id); load();
   };
 
   const delItem = async (table: string, id: string) => {

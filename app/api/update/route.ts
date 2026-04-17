@@ -52,18 +52,36 @@ export async function GET(req: NextRequest) {
     const targetDate = req.nextUrl.searchParams.get("date") || today;
     const force = req.nextUrl.searchParams.get("force") === "true";
 
-    log("info", `Target: ${targetDate}${force ? " (force)" : ""}`);
+    // ★ NEW : scope — permet de limiter le recalc à UN account ou UNE person
+    const scopeAccountId = req.nextUrl.searchParams.get("account_id");
+    const scopePersonId = req.nextUrl.searchParams.get("person_id");
 
-    // 1. FX rates
+    log("info", `Target: ${targetDate}${force ? " (force)" : ""}${scopeAccountId ? ` account=${scopeAccountId}` : ""}${scopePersonId ? ` person=${scopePersonId}` : ""}`);
+
+    // ★ IMPORTANT : ne réécrit les FX rates QUE pour aujourd'hui ou quand on
+    // update tout (sans scope). Un Pierre qui saisit un dépôt ne doit pas
+    // corrompre les FX d'une date passée pour tout le monde.
     const allFxRates = await fetchAllFxRates();
     const fxUsdEur = allFxRates["USDEUR"] || 0.87;
     log("info", `FX: ${Object.entries(allFxRates).map(([k, v]) => `${k}=${v}`).join(", ")}`);
-    for (const [pair, rate] of Object.entries(allFxRates)) {
-      await sb.from("fx_rates").upsert({ date: targetDate, pair, rate }, { onConflict: "date,pair" });
+
+    const shouldWriteFx = !scopeAccountId && !scopePersonId && targetDate === today;
+    if (shouldWriteFx) {
+      for (const [pair, rate] of Object.entries(allFxRates)) {
+        await sb.from("fx_rates").upsert({ date: targetDate, pair, rate }, { onConflict: "date,pair" });
+      }
+    } else {
+      log("info", `FX skip (scope ou date passée)`);
     }
 
-    // 2. Accounts (stocks)
-    const { data: accounts, error: accErr } = await sb.from("accounts").select("*, people(name)");
+    // ★ NEW : query filtrée selon le scope
+    let accQuery = sb.from("accounts").select("*, people(name)");
+    if (scopeAccountId) {
+      accQuery = accQuery.eq("id", scopeAccountId);
+    } else if (scopePersonId) {
+      accQuery = accQuery.eq("person_id", scopePersonId);
+    }
+    const { data: accounts, error: accErr } = await accQuery;
     if (accErr) throw accErr;
     if (!accounts?.length) return NextResponse.json({ ok: true, logs, updated: 0 });
 
@@ -163,7 +181,9 @@ export async function GET(req: NextRequest) {
           const price = toAccountCcy(rawPrice, h.ticker, fxRate);
           positionsValue += h.shares * price;
 
-          if (price > 0) {
+          // ★ Ne MAJ last_price que si on écrit pour AUJOURD'HUI
+          // Sinon on peut écraser le prix courant avec un prix passé
+          if (price > 0 && isTarget && day === today) {
             await sb.from("holdings").update({ last_price: price, updated_at: new Date().toISOString() }).eq("id", h.id);
           }
         }
@@ -234,17 +254,30 @@ export async function GET(req: NextRequest) {
         else totalUpdated++;
       }
 
-      const { data: subAccsFinal } = await sb.from("sub_accounts").select("cash").eq("account_id", acc.id);
-      const totalCashEur = (subAccsFinal || []).reduce((s: number, sa: any) => s + Number(sa.cash || 0), 0);
-      await sb.from("accounts").update({ cash: Math.round(totalCashEur * 100) / 100 }).eq("id", acc.id);
+      // MAJ du cash agrégé sur l'account parent — uniquement pour aujourd'hui
+      if (targetDate === today) {
+        const { data: subAccsFinal } = await sb.from("sub_accounts").select("cash").eq("account_id", acc.id);
+        const totalCashEur = (subAccsFinal || []).reduce((s: number, sa: any) => s + Number(sa.cash || 0), 0);
+        await sb.from("accounts").update({ cash: Math.round(totalCashEur * 100) / 100 }).eq("id", acc.id);
+      }
     }
 
     // ===========================================================
-    // ★ NEW : NET WORTH SNAPSHOT par personne
+    // NET WORTH SNAPSHOT par personne
     // ===========================================================
     log("info", "── Net Worth snapshots ──");
 
-    const { data: people } = await sb.from("people").select("*");
+    // ★ NEW : ne regénère le NW que pour les personnes concernées par le scope
+    let peopleQuery = sb.from("people").select("*");
+    if (scopePersonId) {
+      peopleQuery = peopleQuery.eq("id", scopePersonId);
+    } else if (scopeAccountId) {
+      // Si on scope par account, trouve le person_id correspondant
+      const { data: accData } = await sb.from("accounts").select("person_id").eq("id", scopeAccountId).single();
+      if (accData) peopleQuery = peopleQuery.eq("id", accData.person_id);
+    }
+    const { data: people } = await peopleQuery;
+
     if (!people?.length) {
       return NextResponse.json({ ok: true, date: targetDate, updated: totalUpdated, logs });
     }
@@ -252,13 +285,11 @@ export async function GET(req: NextRequest) {
     for (const person of people) {
       log("info", `  → ${person.name}`);
 
-      // Récup tous les comptes stocks de cette personne + leurs derniers snapshots à targetDate
       const { data: pAccs } = await sb.from("accounts")
         .select("id, currency").eq("person_id", person.id);
 
       let stocksEur = 0;
       if (pAccs?.length) {
-        // Snapshot du jour cible OU le plus récent <= targetDate
         for (const a of pAccs) {
           const { data: snap } = await sb.from("daily_snapshots")
             .select("portfolio_value, fx_rate").eq("account_id", a.id)
@@ -271,7 +302,6 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      // Banque (soldes manuels — on prend la valeur actuelle)
       const { data: banks } = await sb.from("bank_accounts")
         .select("balance, currency").eq("person_id", person.id);
       let bankEur = 0;
@@ -280,7 +310,6 @@ export async function GET(req: NextRequest) {
         bankEur += Number(b.balance || 0) * fx;
       }
 
-      // Immo (valeur × ownership%)
       const { data: props } = await sb.from("properties")
         .select("current_value, ownership_pct, currency").eq("person_id", person.id);
       let realEstateEur = 0;
@@ -289,7 +318,6 @@ export async function GET(req: NextRequest) {
         realEstateEur += Number(p.current_value || 0) * (Number(p.ownership_pct || 100) / 100) * fx;
       }
 
-      // Dettes
       const { data: ls } = await sb.from("loans")
         .select("current_balance, currency").eq("person_id", person.id);
       let loansEur = 0;
@@ -321,6 +349,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ ok: true, date: targetDate, updated: totalUpdated, logs });
   } catch (e: any) {
     log("error", e.message || String(e));
-    return NextResponse.json({ ok: false, error: e.message, logs }, { status: 500 });
+    return NextResponse.json({ ok: false, error: e.message, logs: [{ level: "error" as const, msg: e.message }] }, { status: 500 });
   }
 }
