@@ -8,7 +8,7 @@ import {
 } from "@/lib/yahoo";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 type Log = { level: "info" | "warn" | "error"; msg: string };
 
@@ -26,24 +26,28 @@ function tradingDays(from: string, to: string): string[] {
 function pickPrice(history: Map<string, number>, date: string, fallback: number): number {
   if (history.has(date)) return history.get(date)!;
   const d = new Date(date);
-  for (let i = 1; i <= 5; i++) {
+  for (let i = 1; i <= 7; i++) {
     d.setDate(d.getDate() - 1);
     if (history.has(d.toISOString().slice(0, 10))) return history.get(d.toISOString().slice(0, 10))!;
   }
   return fallback;
 }
 
-/**
- * Rebuild complet de l'historique des snapshots d'une personne à partir de :
- * - Ses trades (BUY/SELL) pour reconstituer les holdings à chaque date
- * - Ses cash_movements pour reconstituer le cash à chaque date
- * - Les prix historiques Yahoo pour valoriser chaque jour
- *
- * Usage : GET /api/rebuild?person_id=XXX&from=2025-12-31&to=2026-04-17
- *
- * ⚠️ Supprime TOUS les daily_snapshots + networth_snapshots de cette personne
- *    dans l'intervalle [from, to] avant de les reconstruire proprement.
- */
+function tickerCurrency(ticker: string): string {
+  if (ticker.endsWith(".AX")) return "AUD";
+  if (ticker.endsWith(".PA") || ticker.endsWith(".AS") || ticker.endsWith(".BR") || ticker.endsWith(".DE") || ticker.endsWith(".SG")) return "EUR";
+  if (ticker.endsWith(".L")) return "GBP";
+  if (ticker.endsWith(".TO") || ticker.endsWith(".V")) return "CAD";
+  if (ticker.endsWith(".MX")) return "USD";
+  return "USD";
+}
+
+function tradeCurrency(notes: string | null, accountCurrency: string): string {
+  if (!notes) return accountCurrency;
+  const match = notes.match(/^\[([A-Z]{3})\]/);
+  return match ? match[1] : accountCurrency;
+}
+
 export async function GET(req: NextRequest) {
   const secret = process.env.CRON_SECRET;
   if (secret) {
@@ -54,7 +58,10 @@ export async function GET(req: NextRequest) {
   }
 
   const logs: Log[] = [];
-  const log = (level: Log["level"], msg: string) => logs.push({ level, msg });
+  const log = (level: Log["level"], msg: string) => {
+    logs.push({ level, msg });
+    console.log(`[rebuild][${level}] ${msg}`);
+  };
 
   try {
     const sb = createServerSupabase();
@@ -64,206 +71,272 @@ export async function GET(req: NextRequest) {
     const toDate = req.nextUrl.searchParams.get("to") || new Date().toISOString().slice(0, 10);
 
     if (!personId) return NextResponse.json({ error: "person_id requis" }, { status: 400 });
-    if (!fromDate) return NextResponse.json({ error: "from requis (format YYYY-MM-DD)" }, { status: 400 });
+    if (!fromDate) return NextResponse.json({ error: "from requis (YYYY-MM-DD)" }, { status: 400 });
 
-    log("info", `Rebuild ${personId} de ${fromDate} à ${toDate}`);
+    log("info", `━━━ REBUILD ${personId} ${fromDate} → ${toDate} ━━━`);
 
-    // 1. FX live (pour référence) + historique
     const allFxRates = await fetchAllFxRates();
     const fxUsdEur = allFxRates["USDEUR"] || 0.87;
+    log("info", `FX actuel USDEUR=${fxUsdEur.toFixed(4)}`);
 
-    // 2. Charger tous les comptes de la personne
     const { data: accounts } = await sb.from("accounts")
       .select("*, people(name)").eq("person_id", personId);
     if (!accounts?.length) return NextResponse.json({ error: "Pas de comptes" }, { status: 404 });
 
     const accountIds = accounts.map(a => a.id);
+    const person = (accounts[0] as any).people?.name || personId.slice(0, 8);
 
-    // 3. Supprimer les snapshots existants dans l'intervalle
+    const [tradesR, cashMovsR, pnlsR, divsR] = await Promise.all([
+      sb.from("trades").select("*").in("account_id", accountIds).order("date", { ascending: true }),
+      sb.from("cash_movements").select("*").in("account_id", accountIds).order("date", { ascending: true }),
+      sb.from("realized_pnl").select("*").in("account_id", accountIds).order("date", { ascending: true }),
+      sb.from("dividends").select("*").in("account_id", accountIds).order("date", { ascending: true }),
+    ]);
+
+    const trades = tradesR.data || [];
+    const cashMovs = cashMovsR.data || [];
+    const pnls = pnlsR.data || [];
+    const dividends = divsR.data || [];
+
+    log("info", `Data: ${trades.length} trades, ${cashMovs.length} cash, ${pnls.length} pnl, ${dividends.length} div`);
+
     await sb.from("daily_snapshots").delete()
       .in("account_id", accountIds).gte("date", fromDate).lte("date", toDate);
     await sb.from("networth_snapshots").delete()
       .eq("person_id", personId).gte("date", fromDate).lte("date", toDate);
-    log("info", "Anciens snapshots supprimés");
+    log("info", "Anciens snapshots nettoyés");
 
-    // 4. Charger tous les trades + cash_movements de la personne
-    const { data: trades } = await sb.from("trades").select("*")
-      .in("account_id", accountIds).order("date", { ascending: true });
-    const { data: cashMovs } = await sb.from("cash_movements").select("*")
-      .in("account_id", accountIds).order("date", { ascending: true });
+    const allTickers = Array.from(new Set([
+      ...trades.map(t => t.ticker),
+      ...accounts.flatMap(a => BENCHMARK[a.benchmark] ? [BENCHMARK[a.benchmark]] : []),
+    ]));
 
-    log("info", `Trades: ${trades?.length || 0}, cash_movements: ${cashMovs?.length || 0}`);
+    const days = tradingDays(fromDate, toDate);
+    const daysBack = Math.max(days.length + 30, 30);
 
-    // 5. Calculer le nombre de jours à rebuild pour fetcher les bons historiques
-    const daysNeeded = tradingDays(fromDate, toDate);
-    const daysBack = Math.max(daysNeeded.length + 30, 30);
+    log("info", `Fetching prices for ${allTickers.length} tickers over ${daysBack}d...`);
+    const [histories, fxHistory] = await Promise.all([
+      fetchHistoryBatch(allTickers, daysBack),
+      fetchFxHistory(daysBack),
+    ]);
+    const missingTickers = allTickers.filter(t => !histories.has(t) || histories.get(t)!.size < 5);
+    if (missingTickers.length) log("warn", `Prix manquants: ${missingTickers.join(", ")}`);
 
-    // 6. Pour chaque compte, reconstruire son historique
-    const bankData = await sb.from("bank_accounts").select("balance, currency").eq("person_id", personId);
-    const propData = await sb.from("properties").select("current_value, ownership_pct, currency").eq("person_id", personId);
-    const loanData = await sb.from("loans").select("current_balance, currency").eq("person_id", personId);
+    // ─────────────────────────────────────────────
+    // STRATEGY : on TIENT TOUT EN EUR côté cash
+    // ─────────────────────────────────────────────
+    // - cash_movements.amount = EUR (toujours)
+    // - trades.price avec notes=[EUR] sur compte USD = EUR natif
+    // - trades.price avec notes=[USD] sur compte USD = USD (converti en EUR)
+    // - trades sur PEA = EUR natif
+    // - dividends.amount = EUR
+    // - realized_pnl.amount = EUR
+    //
+    // Les holdings sont toujours évalués en prix natif ticker, converti en EUR.
+    // Le snapshot stocke portfolio_value dans la devise du compte (USD ou EUR),
+    // mais on calcule tout en EUR en interne.
+    // ─────────────────────────────────────────────
 
-    // NW cumulatifs par date
-    const nwByDate: Record<string, { stocks: number; bank: number; realEstate: number; loans: number }> = {};
+    type AccState = {
+      acc: any;
+      cashEur: number;                       // CASH EN EUR pour tous les comptes
+      sharesByTicker: Record<string, number>;
+    };
 
-    for (const acc of accounts) {
-      const who = (acc as any).people?.name || "?";
-      const isCto = acc.currency === "USD";
-      log("info", `── ${who} ${acc.type} (${acc.currency}) ──`);
+    const states: Record<string, AccState> = {};
+    for (const a of accounts) {
+      states[a.id] = { acc: a, cashEur: 0, sharesByTicker: {} };
+    }
 
-      // Trades et cash de CE compte, triés par date
-      const accTrades = (trades || []).filter(t => t.account_id === acc.id);
-      const accCash = (cashMovs || []).filter(c => c.account_id === acc.id);
+    const indexByDate = <T extends { date: string }>(arr: T[]) => {
+      const map: Record<string, T[]> = {};
+      for (const item of arr) {
+        if (!map[item.date]) map[item.date] = [];
+        map[item.date].push(item);
+      }
+      return map;
+    };
 
-      // Tous les tickers que Pierre a eu sur ce compte (pour fetch historique)
-      const tickersEver = Array.from(new Set(accTrades.map(t => t.ticker)));
-      const benchTicker = BENCHMARK[acc.benchmark];
-      const allTickers = [...tickersEver, ...(benchTicker ? [benchTicker] : [])];
+    const tradesByDate = indexByDate(trades);
+    const cashByDate = indexByDate(cashMovs);
+    const pnlsByDate = indexByDate(pnls);
+    const divsByDate = indexByDate(dividends);
 
-      if (!allTickers.length) {
-        log("info", "  Pas de trades, skip");
-        continue;
+    const getFxForDate = (date: string): number => pickPrice(fxHistory, date, fxUsdEur);
+
+    /**
+     * Applique un trade. Prix converti en EUR pour alimenter cashEur.
+     */
+    const applyTrade = (t: any, dayFx: number) => {
+      const s = states[t.account_id];
+      if (!s) return;
+
+      const shares = Number(t.shares);
+      const priceRaw = Number(t.price);
+      const fees = Number(t.fees || 0);
+      const tradeCcy = tradeCurrency(t.notes, s.acc.currency);
+
+      // Convertir prix + fees en EUR
+      let priceEur = priceRaw;
+      let feesEur = fees;
+      if (tradeCcy === "USD") {
+        priceEur = priceRaw * dayFx;
+        feesEur = fees * dayFx;
+      } else if (tradeCcy !== "EUR") {
+        const toEurRate = allFxRates[`${tradeCcy}EUR`] || 1;
+        priceEur = priceRaw * toEurRate;
+        feesEur = fees * toEurRate;
       }
 
-      // Fetch prix historiques pour tous ces tickers
-      const [histories, fxHistory] = await Promise.all([
-        fetchHistoryBatch(allTickers, daysBack),
-        fetchFxHistory(daysBack),
-      ]);
+      if (t.side === "BUY") {
+        s.sharesByTicker[t.ticker] = (s.sharesByTicker[t.ticker] || 0) + shares;
+        s.cashEur -= shares * priceEur + feesEur;
+      } else {
+        s.sharesByTicker[t.ticker] = (s.sharesByTicker[t.ticker] || 0) - shares;
+        s.cashEur += shares * priceEur - feesEur;
+      }
+    };
 
-      const tickerCurrency = (ticker: string): string => {
-        if (ticker.endsWith(".AX")) return "AUD";
-        if (ticker.endsWith(".PA") || ticker.endsWith(".BR") || ticker.endsWith(".DE")) return "EUR";
-        if (ticker.endsWith(".L")) return "GBP";
-        if (ticker.endsWith(".TO") || ticker.endsWith(".V")) return "CAD";
-        return "USD";
-      };
+    // cash_movements en EUR (même sur CTO — confirmé)
+    const applyCash = (cm: any) => {
+      const s = states[cm.account_id];
+      if (s) s.cashEur += Number(cm.amount);
+    };
 
-      const toAccountCcy = (price: number, ticker: string, dayFxRate: number): number => {
-        const priceCcy = tickerCurrency(ticker);
-        if (priceCcy === acc.currency) return price;
+    const applyPnl = (p: any) => {
+      const s = states[p.account_id];
+      if (s) s.cashEur += Number(p.amount);
+    };
 
-        const usdeur = dayFxRate;
-        const audeur = allFxRates["AUDEUR"] || 0.61;
-        const cadeur = allFxRates["CADEUR"] || 0.63;
+    const applyDiv = (d: any) => {
+      const s = states[d.account_id];
+      if (s) s.cashEur += Number(d.amount);
+    };
 
-        let priceEur = price;
-        if (priceCcy === "USD") priceEur = price * usdeur;
-        else if (priceCcy === "AUD") priceEur = price * audeur;
-        else if (priceCcy === "CAD") priceEur = price * cadeur;
+    // ─────────────────────────────────────────────
+    // Catch-up avant fromDate
+    // ─────────────────────────────────────────────
+    for (const cm of cashMovs) if (cm.date < fromDate) applyCash(cm);
+    for (const t of trades) if (t.date < fromDate) applyTrade(t, getFxForDate(t.date));
+    for (const p of pnls) if (p.date < fromDate) applyPnl(p);
+    for (const d of dividends) if (d.date < fromDate) applyDiv(d);
 
-        if (acc.currency === "EUR") return priceEur;
-        if (acc.currency === "USD") return usdeur > 0 ? priceEur / usdeur : priceEur;
-        return priceEur;
-      };
+    log("info", `État au ${fromDate} : ${Object.values(states).map(s => `${s.acc.type}=${s.cashEur.toFixed(0)}EUR`).join(", ")}`);
 
-      let prevIndexAdj: number | null = null;
-      let prevIndexRaw: number | null = null;
+    // ─────────────────────────────────────────────
+    // Boucle jour par jour
+    // ─────────────────────────────────────────────
 
-      for (const day of daysNeeded) {
-        // Reconstituer les holdings à cette date :
-        // shares(ticker, day) = sum(BUY.shares) - sum(SELL.shares) pour trades <= day
-        const sharesByTicker: Record<string, number> = {};
-        for (const t of accTrades) {
-          if (t.date > day) break;
-          const delta = t.side === "BUY" ? Number(t.shares) : -Number(t.shares);
-          sharesByTicker[t.ticker] = (sharesByTicker[t.ticker] || 0) + delta;
-        }
+    const nwByDate: Record<string, { stocks: number; bank: number; realEstate: number; loans: number }> = {};
+    const prevIndexByAcc: Record<string, { adj: number; raw: number } | null> = {};
+    accounts.forEach(a => { prevIndexByAcc[a.id] = null; });
 
-        // Valoriser chaque position avec le prix du jour
-        const fxRate = pickPrice(fxHistory, day, fxUsdEur);
-        let positionsValue = 0;
-        for (const [ticker, shares] of Object.entries(sharesByTicker)) {
-          if (shares <= 0) continue;
+    let processed = 0;
+    for (const day of days) {
+      const dayFx = getFxForDate(day);
+
+      for (const cm of (cashByDate[day] || [])) applyCash(cm);
+      for (const t of (tradesByDate[day] || [])) applyTrade(t, dayFx);
+      for (const p of (pnlsByDate[day] || [])) applyPnl(p);
+      for (const d of (divsByDate[day] || [])) applyDiv(d);
+
+      let totalStocksEur = 0;
+
+      for (const a of accounts) {
+        const s = states[a.id];
+        const isCto = a.currency === "USD";
+
+        // Positions valorisées en EUR
+        let positionsEur = 0;
+        for (const [ticker, shares] of Object.entries(s.sharesByTicker)) {
+          if (shares <= 0.00001) continue;
           const hist = histories.get(ticker);
           const rawPrice = hist ? pickPrice(hist, day, 0) : 0;
           if (rawPrice <= 0) continue;
-          const price = toAccountCcy(rawPrice, ticker, fxRate);
-          positionsValue += shares * price;
+
+          const priceCcy = tickerCurrency(ticker);
+          let priceEur = rawPrice;
+          if (priceCcy === "USD") priceEur = rawPrice * dayFx;
+          else if (priceCcy !== "EUR") priceEur = rawPrice * (allFxRates[`${priceCcy}EUR`] || 1);
+
+          positionsEur += shares * priceEur;
         }
 
-        // Cash à cette date = somme des cash_movements + delta des trades
-        let cashEur = 0;
-        for (const cm of accCash) {
-          if (cm.date > day) break;
-          cashEur += Number(cm.amount);
-        }
-        for (const t of accTrades) {
-          if (t.date > day) break;
-          // Pour les trades, on convertit en EUR avec le fx_rate du jour DU TRADE
-          // Simplification : on prend fx actuel — suffisant pour reconstitution
-          const tFx = acc.currency === "USD" ? fxUsdEur : 1;
-          const cost = Number(t.price) * Number(t.shares) + Number(t.fees || 0);
-          const costEur = tickerCurrency(t.ticker) === "USD" ? cost * fxUsdEur : cost;
-          cashEur += t.side === "BUY" ? -costEur : costEur;
-        }
+        const ptfEur = positionsEur + s.cashEur;
+        totalStocksEur += ptfEur;
 
-        let ptfValue: number;
-        if (isCto) {
-          ptfValue = positionsValue + (fxRate > 0 ? cashEur / fxRate : 0);
-        } else {
-          ptfValue = positionsValue + cashEur;
-        }
+        // Snapshot en devise du compte (pour compat UI)
+        const ptfNative = isCto ? (dayFx > 0 ? ptfEur / dayFx : ptfEur) : ptfEur;
+        const cashNative = isCto ? (dayFx > 0 ? s.cashEur / dayFx : s.cashEur) : s.cashEur;
 
-        // Index (benchmark)
+        const benchTicker = BENCHMARK[a.benchmark];
         const benchHist = benchTicker ? histories.get(benchTicker) : undefined;
-        let indexRaw = benchHist ? pickPrice(benchHist, day, 0) : 0;
+        const indexRaw = benchHist ? pickPrice(benchHist, day, 0) : 0;
 
-        const { data: deposits } = await sb.from("cash_movements")
-          .select("amount").eq("account_id", acc.id).eq("date", day);
-        const totalDepositEur = (deposits || []).reduce((s: number, d: any) => s + Number(d.amount), 0);
-        const depositNative = isCto && fxRate > 0 ? totalDepositEur / fxRate : totalDepositEur;
+        const depositsToday = (cashByDate[day] || [])
+          .filter(cm => cm.account_id === a.id)
+          .reduce((sum: number, cm: any) => sum + Number(cm.amount), 0);
+        // depositsToday est en EUR ; pour un CTO on convertit en native
+        const depositsNative = isCto ? (dayFx > 0 ? depositsToday / dayFx : depositsToday) : depositsToday;
 
+        const prev = prevIndexByAcc[a.id];
         let indexAdj: number;
-        if (prevIndexAdj !== null && indexRaw > 0 && prevIndexRaw && prevIndexRaw > 0) {
-          const dailyReturn = indexRaw / prevIndexRaw;
-          indexAdj = prevIndexAdj * dailyReturn + depositNative;
-        } else if (prevIndexAdj !== null) {
-          indexAdj = prevIndexAdj + depositNative;
+        if (prev && indexRaw > 0 && prev.raw > 0) {
+          const dailyReturn = indexRaw / prev.raw;
+          indexAdj = prev.adj * dailyReturn + depositsNative;
+        } else if (prev) {
+          indexAdj = prev.adj + depositsNative;
         } else {
-          indexAdj = ptfValue;
+          indexAdj = ptfNative;
         }
 
-        prevIndexAdj = indexAdj;
-        prevIndexRaw = indexRaw > 0 ? indexRaw : prevIndexRaw;
+        prevIndexByAcc[a.id] = {
+          adj: indexAdj,
+          raw: indexRaw > 0 ? indexRaw : (prev?.raw || 0),
+        };
 
-        // Écrire le snapshot
         await sb.from("daily_snapshots").upsert({
-          account_id: acc.id, date: day,
-          portfolio_value: Math.round(ptfValue * 100) / 100,
+          account_id: a.id,
+          date: day,
+          portfolio_value: Math.round(ptfNative * 100) / 100,
           index_value: Math.round(indexAdj * 100) / 100,
           index_raw: Math.round(indexRaw * 100) / 100,
-          cash: Math.round(cashEur * 100) / 100,
-          fx_rate: fxRate, confirmed: true,
+          cash: Math.round(s.cashEur * 100) / 100,    // cash stocké en EUR partout
+          fx_rate: dayFx,
+          confirmed: true,
         }, { onConflict: "account_id,date" });
+      }
 
-        // Cumul pour networth
-        const ptfEur = isCto ? ptfValue * fxRate : ptfValue;
-        if (!nwByDate[day]) nwByDate[day] = { stocks: 0, bank: 0, realEstate: 0, loans: 0 };
-        nwByDate[day].stocks += ptfEur;
+      if (!nwByDate[day]) nwByDate[day] = { stocks: 0, bank: 0, realEstate: 0, loans: 0 };
+      nwByDate[day].stocks = totalStocksEur;
 
-        if (day === daysNeeded[0] || day === daysNeeded[daysNeeded.length - 1]) {
-          log("info", `  ${day}: ptf=${ptfValue.toFixed(0)} cash=${cashEur.toFixed(0)}`);
-        }
+      processed++;
+      if (processed % 20 === 0 || day === days[0] || day === days[days.length - 1]) {
+        log("info", `${day}: ${Object.values(states).map(s => `${s.acc.type}=${s.cashEur.toFixed(0)}EUR`).join(" ")} ptfEur=${totalStocksEur.toFixed(0)}`);
       }
     }
 
-    // 7. Calculer les networth_snapshots (bank/immo/loans sont pris en valeur actuelle — simplification)
-    let bankEur = 0;
-    for (const b of (bankData.data || [])) {
+    // ─────────────────────────────────────────────
+    // Networth snapshots
+    // ─────────────────────────────────────────────
+    const [bankR, propR, loanR] = await Promise.all([
+      sb.from("bank_accounts").select("balance, currency").eq("person_id", personId),
+      sb.from("properties").select("current_value, ownership_pct, currency").eq("person_id", personId),
+      sb.from("loans").select("current_balance, currency").eq("person_id", personId),
+    ]);
+
+    const bankEur = (bankR.data || []).reduce((s, b) => {
       const fx = b.currency === "EUR" ? 1 : (allFxRates[`${b.currency}EUR`] || 1);
-      bankEur += Number(b.balance || 0) * fx;
-    }
-    let realEstateEur = 0;
-    for (const p of (propData.data || [])) {
+      return s + Number(b.balance || 0) * fx;
+    }, 0);
+    const realEstateEur = (propR.data || []).reduce((s, p) => {
       const fx = p.currency === "EUR" ? 1 : (allFxRates[`${p.currency}EUR`] || 1);
-      realEstateEur += Number(p.current_value || 0) * (Number(p.ownership_pct || 100) / 100) * fx;
-    }
-    let loansEur = 0;
-    for (const l of (loanData.data || [])) {
+      return s + Number(p.current_value || 0) * (Number(p.ownership_pct || 100) / 100) * fx;
+    }, 0);
+    const loansEur = (loanR.data || []).reduce((s, l) => {
       const fx = l.currency === "EUR" ? 1 : (allFxRates[`${l.currency}EUR`] || 1);
-      loansEur += Number(l.current_balance || 0) * fx;
-    }
+      return s + Number(l.current_balance || 0) * fx;
+    }, 0);
 
     for (const [day, cats] of Object.entries(nwByDate)) {
       cats.bank = bankEur;
@@ -285,9 +358,16 @@ export async function GET(req: NextRequest) {
       }, { onConflict: "person_id,date,currency" });
     }
 
-    log("info", `✓ Rebuild terminé — ${Object.keys(nwByDate).length} jours`);
+    log("info", `━━━ DONE: ${processed} jours ━━━`);
 
-    return NextResponse.json({ ok: true, days: Object.keys(nwByDate).length, logs });
+    return NextResponse.json({
+      ok: true,
+      person,
+      from: fromDate,
+      to: toDate,
+      days: processed,
+      logs: logs.slice(-50),
+    });
   } catch (e: any) {
     log("error", e.message || String(e));
     return NextResponse.json({ ok: false, error: e.message, logs }, { status: 500 });
