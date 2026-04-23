@@ -55,7 +55,7 @@ export default function RebuildAdminPage() {
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
       setPreview(data);
-      setOverrides({});
+      setOverrides({});  // Reset overrides à chaque nouveau jour
     } catch (e: any) {
       setMsg("❌ " + e.message);
     } finally {
@@ -138,7 +138,7 @@ export default function RebuildAdminPage() {
     }));
   };
 
-  // Recalcule le total attendu avec les overrides appliqués en live
+  // Recalcul live avec overrides
   const computeLivePreview = () => {
     if (!preview) return null;
     let total = 0;
@@ -230,9 +230,9 @@ export default function RebuildAdminPage() {
                   <div className="text-[10px] text-[var(--text-3)] uppercase tracking-wider">Portfolio EUR (calculé)</div>
                   <div className="text-2xl font-mono font-semibold">{fmt(preview.totalPtfEur, 0)}€</div>
                 </div>
-                {live && live.total !== preview.totalPtfEur && (
+                {live && Math.abs(live.total - preview.totalPtfEur) > 0.01 && (
                   <div>
-                    <div className="text-[10px] text-[var(--amber)] uppercase tracking-wider">Portfolio EUR (avec édits)</div>
+                    <div className="text-[10px] text-[var(--amber)] uppercase tracking-wider">Avec édits</div>
                     <div className="text-2xl font-mono font-semibold text-[var(--amber)]">{fmt(live.total, 0)}€</div>
                   </div>
                 )}
@@ -287,94 +287,104 @@ export default function RebuildAdminPage() {
               </div>
             )}
 
-            {Object.entries(preview.preview).map(([accId, acc]: any) => (
-              <div key={accId} className="card-static p-4 mb-4">
-                <div className="flex items-baseline justify-between mb-3">
-                  <div>
-                    <span className="text-sm font-semibold">{acc.accountType}</span>
-                    <span className="text-[var(--text-3)] text-xs ml-2">({acc.currency})</span>
-                  </div>
-                  <div className="font-mono text-sm">
-                    <span className="text-[var(--text-3)]">Total: </span>
-                    <span className="font-semibold">{fmt(live?.perAcc[accId] ?? acc.ptfEur, 2)}€</span>
-                  </div>
-                </div>
+            {Object.entries(preview.preview).map(([accId, acc]: any) => {
+              const ovCash = overrides[accId]?.cashEur;
+              const cashValue = ovCash !== undefined ? ovCash : acc.cashEur;
 
-                <div className="mb-3 flex items-center gap-3">
-                  <span className="text-xs font-mono text-[var(--text-3)] w-20">Cash (EUR)</span>
-                  <input
-                    type="number"
-                    step="0.01"
-                    defaultValue={acc.cashEur}
-                    onChange={e => updateCashOverride(accId, e.target.value)}
-                    className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-2 py-1 text-sm font-mono w-32"
-                  />
-                  {overrides[accId]?.cashEur !== undefined && (
-                    <span className="text-[10px] text-[var(--amber)]">édité (calc: {fmt(acc.cashEur)})</span>
+              return (
+                <div key={accId} className="card-static p-4 mb-4">
+                  <div className="flex items-baseline justify-between mb-3">
+                    <div>
+                      <span className="text-sm font-semibold">{acc.accountType}</span>
+                      <span className="text-[var(--text-3)] text-xs ml-2">({acc.currency})</span>
+                    </div>
+                    <div className="font-mono text-sm">
+                      <span className="text-[var(--text-3)]">Total: </span>
+                      <span className="font-semibold">{fmt(live?.perAcc[accId] ?? acc.ptfEur, 2)}€</span>
+                    </div>
+                  </div>
+
+                  <div className="mb-3 flex items-center gap-3">
+                    <span className="text-xs font-mono text-[var(--text-3)] w-20">Cash (EUR)</span>
+                    {/* ★ INPUT CONTRÔLÉ : se rafraîchit quand on change de jour */}
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={cashValue}
+                      onChange={e => updateCashOverride(accId, e.target.value)}
+                      className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-2 py-1 text-sm font-mono w-32"
+                    />
+                    {ovCash !== undefined && (
+                      <span className="text-[10px] text-[var(--amber)]">édité (calc: {fmt(acc.cashEur)})</span>
+                    )}
+                  </div>
+
+                  {acc.holdings.length > 0 ? (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-[var(--text-3)] border-b border-[var(--border)]">
+                            <th className="text-left py-1.5 px-2">Ticker</th>
+                            <th className="text-right py-1.5 px-2">Parts</th>
+                            <th className="text-right py-1.5 px-2">Prix natif</th>
+                            <th className="text-right py-1.5 px-2">Prix EUR (éditable)</th>
+                            <th className="text-right py-1.5 px-2">Valeur EUR</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {acc.holdings.map((h: any) => {
+                            const ovSh = overrides[accId]?.holdings?.[h.ticker];
+                            const ovPr = overrides[accId]?.priceEurOverrides?.[h.ticker];
+                            const sharesValue = ovSh !== undefined ? ovSh : h.shares;
+                            const priceValue = ovPr !== undefined ? ovPr : h.priceEur;
+                            const effValue = sharesValue * priceValue;
+
+                            return (
+                              <tr key={h.ticker} className="border-b border-[var(--border)]/30">
+                                <td className="py-1.5 px-2 font-mono font-semibold">
+                                  {h.ticker}
+                                  {h.priceSource === "missing" && <span className="ml-1 text-[10px] text-[var(--red)]">⚠ no price</span>}
+                                  {h.priceSource === "live-fallback" && <span className="ml-1 text-[10px] text-[var(--amber)]" title="Prix actuel utilisé (pas d'historique pour cette date)">📡 live</span>}
+                                </td>
+                                <td className="py-1.5 px-2 text-right">
+                                  {/* ★ INPUT CONTRÔLÉ */}
+                                  <input
+                                    type="number" step="any"
+                                    value={sharesValue}
+                                    onChange={e => updateHoldingOverride(accId, h.ticker, e.target.value)}
+                                    className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-20 text-right"
+                                  />
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono text-[var(--text-3)]">
+                                  {fmt(h.priceNative, 4)} {h.priceCcy}
+                                </td>
+                                <td className="py-1.5 px-2 text-right">
+                                  {/* ★ INPUT CONTRÔLÉ */}
+                                  <input
+                                    type="number" step="any"
+                                    value={priceValue}
+                                    onChange={e => updatePriceOverride(accId, h.ticker, e.target.value)}
+                                    className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-24 text-right"
+                                    style={{ color: ovPr !== undefined ? "var(--amber)" : undefined }}
+                                  />
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono">
+                                  <span style={{ color: (ovSh !== undefined || ovPr !== undefined) ? "var(--amber)" : undefined }}>
+                                    {fmt(effValue, 2)}
+                                  </span>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-[var(--text-3)] font-mono italic">Aucune position</div>
                   )}
                 </div>
-
-                {acc.holdings.length > 0 ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr className="text-[var(--text-3)] border-b border-[var(--border)]">
-                          <th className="text-left py-1.5 px-2">Ticker</th>
-                          <th className="text-right py-1.5 px-2">Parts</th>
-                          <th className="text-right py-1.5 px-2">Prix natif</th>
-                          <th className="text-right py-1.5 px-2">Prix EUR (éditable)</th>
-                          <th className="text-right py-1.5 px-2">Valeur EUR</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {acc.holdings.map((h: any) => {
-                          const ovSh = overrides[accId]?.holdings?.[h.ticker];
-                          const ovPr = overrides[accId]?.priceEurOverrides?.[h.ticker];
-                          const effShares = ovSh ?? h.shares;
-                          const effPrice = ovPr ?? h.priceEur;
-                          const effValue = effShares * effPrice;
-                          return (
-                            <tr key={h.ticker} className="border-b border-[var(--border)]/30">
-                              <td className="py-1.5 px-2 font-mono font-semibold">
-                                {h.ticker}
-                                {!h.priceAvailable && <span className="ml-1 text-[10px] text-[var(--red)]">⚠ no price</span>}
-                              </td>
-                              <td className="py-1.5 px-2 text-right">
-                                <input
-                                  type="number" step="any"
-                                  defaultValue={h.shares}
-                                  onChange={e => updateHoldingOverride(accId, h.ticker, e.target.value)}
-                                  className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-20 text-right"
-                                />
-                              </td>
-                              <td className="py-1.5 px-2 text-right font-mono text-[var(--text-3)]">
-                                {fmt(h.priceNative, 4)} {h.priceCcy}
-                              </td>
-                              <td className="py-1.5 px-2 text-right">
-                                <input
-                                  type="number" step="any"
-                                  defaultValue={h.priceEur}
-                                  onChange={e => updatePriceOverride(accId, h.ticker, e.target.value)}
-                                  className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-24 text-right"
-                                  style={{ color: ovPr !== undefined ? "var(--amber)" : undefined }}
-                                />
-                              </td>
-                              <td className="py-1.5 px-2 text-right font-mono">
-                                <span style={{ color: (ovSh !== undefined || ovPr !== undefined) ? "var(--amber)" : undefined }}>
-                                  {fmt(effValue, 2)}
-                                </span>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="text-xs text-[var(--text-3)] font-mono italic">Aucune position</div>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </>
         )}
       </div>
