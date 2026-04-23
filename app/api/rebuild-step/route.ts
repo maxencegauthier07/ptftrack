@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerSupabase } from "@/lib/supabase-server";
 import {
+  fetchPrices,
   fetchAllFxRates,
   fetchHistoryBatch,
   fetchFxHistory,
@@ -25,7 +26,7 @@ function tickerCurrency(ticker: string): string {
   if (ticker.endsWith(".PA") || ticker.endsWith(".AS") || ticker.endsWith(".BR") || ticker.endsWith(".DE") || ticker.endsWith(".SG")) return "EUR";
   if (ticker.endsWith(".L")) return "GBP";
   if (ticker.endsWith(".TO") || ticker.endsWith(".V")) return "CAD";
-  if (ticker.endsWith(".MX")) return "MXN"; // Mexican peso — le prix Yahoo est en MXN, pas USD !
+  if (ticker.endsWith(".MX")) return "MXN";
   return "USD";
 }
 
@@ -35,12 +36,10 @@ function tradeCurrency(notes: string | null, accountCurrency: string): string {
   return match ? match[1] : accountCurrency;
 }
 
-// MXN ≈ 0.049 EUR (taux approximatif)
-// On ajoute MXNEUR au FX map si pas fourni
 function resolveFxToEur(ccy: string, dayFx: number, allFxRates: Record<string, number>): number {
   if (ccy === "EUR") return 1;
   if (ccy === "USD") return dayFx;
-  if (ccy === "MXN") return allFxRates["MXNEUR"] || 0.049; // Hardcoded fallback si pas fetché
+  if (ccy === "MXN") return allFxRates["MXNEUR"] || 0.049;
   return allFxRates[`${ccy}EUR`] || 1;
 }
 
@@ -99,11 +98,9 @@ function computeStateUpToDate(
     const fees = Number(t.fees || 0);
     const tradeCcy = tradeCurrency(t.notes, s.acc.currency);
 
-    let priceEur = priceRaw;
-    let feesEur = fees;
     const fxToEur = resolveFxToEur(tradeCcy, dayFx, allFxRates);
-    priceEur = priceRaw * fxToEur;
-    feesEur = fees * fxToEur;
+    const priceEur = priceRaw * fxToEur;
+    const feesEur = fees * fxToEur;
 
     if (t.side === "BUY") {
       s.sharesByTicker[t.ticker] = (s.sharesByTicker[t.ticker] || 0) + shares;
@@ -152,9 +149,11 @@ export async function GET(req: NextRequest) {
       ...ctx.accounts.flatMap((a: any) => BENCHMARK[a.benchmark] ? [BENCHMARK[a.benchmark]] : []),
     ]));
 
-    const [histories, fxHistory] = await Promise.all([
+    // ★ Fetch en parallèle : historique + prix actuels (live, fallback ETC)
+    const [histories, fxHistory, currentPrices] = await Promise.all([
       fetchHistoryBatch(allTickers, 220),
       fetchFxHistory(220),
+      fetchPrices(allTickers),
     ]);
 
     const states = computeStateUpToDate(
@@ -184,7 +183,21 @@ export async function GET(req: NextRequest) {
       for (const [ticker, shares] of Object.entries(s.sharesByTicker)) {
         if (shares <= 0.00001) continue;
         const hist = histories.get(ticker);
-        const rawPrice = hist ? pickPrice(hist, date, 0) : 0;
+        const histPrice = hist ? pickPrice(hist, date, 0) : 0;
+
+        // ★ Fallback : si pas d'historique, utilise prix actuel (live quote)
+        let rawPrice = histPrice;
+        let priceSource: "history" | "live-fallback" | "missing" = "history";
+        if (rawPrice <= 0) {
+          const live = currentPrices.get(ticker);
+          if (live && live > 0) {
+            rawPrice = live;
+            priceSource = "live-fallback";
+          } else {
+            priceSource = "missing";
+          }
+        }
+
         const priceCcy = tickerCurrency(ticker);
         const fxToEur = resolveFxToEur(priceCcy, dayFx, allFxRates);
         const priceEur = rawPrice * fxToEur;
@@ -199,6 +212,7 @@ export async function GET(req: NextRequest) {
           priceEur: Math.round(priceEur * 10000) / 10000,
           valueEur: Math.round(valueEur * 100) / 100,
           priceAvailable: rawPrice > 0,
+          priceSource,
         });
       }
 
@@ -236,18 +250,6 @@ export async function GET(req: NextRequest) {
   }
 }
 
-/**
- * POST body : {
- *   person_id, date,
- *   overrides: {
- *     [accId]: {
- *       cashEur?: number,
- *       holdings?: { [ticker]: number },           // override shares
- *       priceEurOverrides?: { [ticker]: number },  // override prix EUR pour valorisation
- *     }
- *   }
- * }
- */
 export async function POST(req: NextRequest) {
   try {
     const sb = createServerSupabase();
@@ -267,9 +269,10 @@ export async function POST(req: NextRequest) {
       ...ctx.accounts.flatMap((a: any) => BENCHMARK[a.benchmark] ? [BENCHMARK[a.benchmark]] : []),
     ]));
 
-    const [histories, fxHistory] = await Promise.all([
+    const [histories, fxHistory, currentPrices] = await Promise.all([
       fetchHistoryBatch(allTickers, 220),
       fetchFxHistory(220),
+      fetchPrices(allTickers),
     ]);
 
     const states = computeStateUpToDate(
@@ -305,7 +308,11 @@ export async function POST(req: NextRequest) {
           priceEur = priceOverride;
         } else {
           const hist = histories.get(ticker);
-          const rawPrice = hist ? pickPrice(hist, date, 0) : 0;
+          let rawPrice = hist ? pickPrice(hist, date, 0) : 0;
+          if (rawPrice <= 0) {
+            const live = currentPrices.get(ticker);
+            if (live && live > 0) rawPrice = live;
+          }
           if (rawPrice <= 0) continue;
           const priceCcy = tickerCurrency(ticker);
           const fxToEur = resolveFxToEur(priceCcy, dayFx, allFxRates);
