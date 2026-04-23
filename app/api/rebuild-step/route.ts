@@ -25,7 +25,7 @@ function tickerCurrency(ticker: string): string {
   if (ticker.endsWith(".PA") || ticker.endsWith(".AS") || ticker.endsWith(".BR") || ticker.endsWith(".DE") || ticker.endsWith(".SG")) return "EUR";
   if (ticker.endsWith(".L")) return "GBP";
   if (ticker.endsWith(".TO") || ticker.endsWith(".V")) return "CAD";
-  if (ticker.endsWith(".MX")) return "USD";
+  if (ticker.endsWith(".MX")) return "MXN"; // Mexican peso — le prix Yahoo est en MXN, pas USD !
   return "USD";
 }
 
@@ -35,18 +35,14 @@ function tradeCurrency(notes: string | null, accountCurrency: string): string {
   return match ? match[1] : accountCurrency;
 }
 
-/**
- * Calcule l'état "attendu" pour UN jour donné à partir des events DB
- * (cumulés depuis toujours jusqu'au jour demandé inclus).
- *
- * Endpoints :
- *   GET  /api/rebuild-step?person_id=XXX&date=2025-11-15
- *        → retourne { state: { [accId]: { cashEur, holdings } }, preview: { ptfEur, snapshots } }
- *
- *   POST /api/rebuild-step
- *        body: { person_id, date, overrides: { [accId]: { cashEur?, holdings? } } }
- *        → applique les overrides et écrit les snapshots pour CE jour
- */
+// MXN ≈ 0.049 EUR (taux approximatif)
+// On ajoute MXNEUR au FX map si pas fourni
+function resolveFxToEur(ccy: string, dayFx: number, allFxRates: Record<string, number>): number {
+  if (ccy === "EUR") return 1;
+  if (ccy === "USD") return dayFx;
+  if (ccy === "MXN") return allFxRates["MXNEUR"] || 0.049; // Hardcoded fallback si pas fetché
+  return allFxRates[`${ccy}EUR`] || 1;
+}
 
 async function loadContext(sb: any, personId: string) {
   const { data: accounts } = await sb.from("accounts")
@@ -105,14 +101,9 @@ function computeStateUpToDate(
 
     let priceEur = priceRaw;
     let feesEur = fees;
-    if (tradeCcy === "USD") {
-      priceEur = priceRaw * dayFx;
-      feesEur = fees * dayFx;
-    } else if (tradeCcy !== "EUR") {
-      const toEurRate = allFxRates[`${tradeCcy}EUR`] || 1;
-      priceEur = priceRaw * toEurRate;
-      feesEur = fees * toEurRate;
-    }
+    const fxToEur = resolveFxToEur(tradeCcy, dayFx, allFxRates);
+    priceEur = priceRaw * fxToEur;
+    feesEur = fees * fxToEur;
 
     if (t.side === "BUY") {
       s.sharesByTicker[t.ticker] = (s.sharesByTicker[t.ticker] || 0) + shares;
@@ -123,7 +114,6 @@ function computeStateUpToDate(
     }
   };
 
-  // Appliquer tous les events jusqu'à upToDate (inclus)
   for (const cm of cashMovs) {
     if (cm.date > upToDate) break;
     states[cm.account_id]!.cashEur += Number(cm.amount);
@@ -174,7 +164,6 @@ export async function GET(req: NextRequest) {
 
     const dayFx = pickPrice(fxHistory, date, fxUsdEur);
 
-    // Events du jour uniquement (pour affichage dans la UI)
     const dayEvents = {
       trades: ctx.trades.filter((t: any) => t.date === date),
       cashMovs: ctx.cashMovs.filter((cm: any) => cm.date === date),
@@ -182,7 +171,6 @@ export async function GET(req: NextRequest) {
       dividends: ctx.dividends.filter((d: any) => d.date === date),
     };
 
-    // Construire le preview par account
     const preview: Record<string, any> = {};
     let totalPtfEur = 0;
 
@@ -198,11 +186,8 @@ export async function GET(req: NextRequest) {
         const hist = histories.get(ticker);
         const rawPrice = hist ? pickPrice(hist, date, 0) : 0;
         const priceCcy = tickerCurrency(ticker);
-        let priceEur = rawPrice;
-        if (rawPrice > 0) {
-          if (priceCcy === "USD") priceEur = rawPrice * dayFx;
-          else if (priceCcy !== "EUR") priceEur = rawPrice * (allFxRates[`${priceCcy}EUR`] || 1);
-        }
+        const fxToEur = resolveFxToEur(priceCcy, dayFx, allFxRates);
+        const priceEur = rawPrice * fxToEur;
         const valueEur = shares * priceEur;
         positionsEur += valueEur;
 
@@ -233,7 +218,6 @@ export async function GET(req: NextRequest) {
       };
     }
 
-    // Snapshots existants pour cette date (pour voir si déjà fait)
     const accountIds = ctx.accounts.map((a: any) => a.id);
     const { data: existingSnaps } = await sb.from("daily_snapshots")
       .select("*").in("account_id", accountIds).eq("date", date);
@@ -253,8 +237,16 @@ export async function GET(req: NextRequest) {
 }
 
 /**
- * POST : écrit les snapshots pour ce jour avec overrides.
- * body : { person_id, date, overrides: { [accId]: { cashEur?, holdings?: {ticker: shares} } } }
+ * POST body : {
+ *   person_id, date,
+ *   overrides: {
+ *     [accId]: {
+ *       cashEur?: number,
+ *       holdings?: { [ticker]: number },           // override shares
+ *       priceEurOverrides?: { [ticker]: number },  // override prix EUR pour valorisation
+ *     }
+ *   }
+ * }
  */
 export async function POST(req: NextRequest) {
   try {
@@ -294,7 +286,6 @@ export async function POST(req: NextRequest) {
       const s = states[a.id];
       const isCto = a.currency === "USD";
 
-      // Appliquer les overrides
       const ov = overrides?.[a.id];
       if (ov) {
         if (typeof ov.cashEur === "number") s.cashEur = ov.cashEur;
@@ -305,17 +296,21 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // Valoriser
       let positionsEur = 0;
       for (const [ticker, shares] of Object.entries(s.sharesByTicker)) {
         if (shares <= 0.00001) continue;
-        const hist = histories.get(ticker);
-        const rawPrice = hist ? pickPrice(hist, date, 0) : 0;
-        if (rawPrice <= 0) continue;
-        const priceCcy = tickerCurrency(ticker);
-        let priceEur = rawPrice;
-        if (priceCcy === "USD") priceEur = rawPrice * dayFx;
-        else if (priceCcy !== "EUR") priceEur = rawPrice * (allFxRates[`${priceCcy}EUR`] || 1);
+        const priceOverride = ov?.priceEurOverrides?.[ticker];
+        let priceEur: number;
+        if (typeof priceOverride === "number" && priceOverride > 0) {
+          priceEur = priceOverride;
+        } else {
+          const hist = histories.get(ticker);
+          const rawPrice = hist ? pickPrice(hist, date, 0) : 0;
+          if (rawPrice <= 0) continue;
+          const priceCcy = tickerCurrency(ticker);
+          const fxToEur = resolveFxToEur(priceCcy, dayFx, allFxRates);
+          priceEur = rawPrice * fxToEur;
+        }
         positionsEur += shares * priceEur;
       }
 
@@ -324,7 +319,6 @@ export async function POST(req: NextRequest) {
 
       const ptfNative = isCto ? (dayFx > 0 ? ptfEur / dayFx : ptfEur) : ptfEur;
 
-      // Benchmark : on récupère prev snapshot de cet account
       const { data: prev } = await sb.from("daily_snapshots")
         .select("index_value, index_raw").eq("account_id", a.id)
         .lt("date", date).order("date", { ascending: false }).limit(1);
@@ -368,7 +362,6 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Networth snapshot
     const [bankR, propR, loanR] = await Promise.all([
       sb.from("bank_accounts").select("balance, currency").eq("person_id", person_id),
       sb.from("properties").select("current_value, ownership_pct, currency").eq("person_id", person_id),

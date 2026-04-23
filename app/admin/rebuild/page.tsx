@@ -2,31 +2,32 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { supabase } from "@/lib/supabase";
-import { ChevronRight, ChevronLeft, Play, Check, X, Loader2, RefreshCw, SkipForward } from "lucide-react";
+import { ChevronLeft, Play, Check, Loader2, RefreshCw, SkipForward } from "lucide-react";
 
 const fmt = (n: number | null | undefined, d = 2) =>
   n == null ? "—" : Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
 
-// Suivant jour de trading (skip samedi/dimanche)
 function nextTradingDay(date: string): string {
   const d = new Date(date);
   d.setDate(d.getDate() + 1);
-  while (d.getDay() === 0 || d.getDay() === 6) {
-    d.setDate(d.getDate() + 1);
-  }
+  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
   return d.toISOString().slice(0, 10);
 }
 
 function prevTradingDay(date: string): string {
   const d = new Date(date);
   d.setDate(d.getDate() - 1);
-  while (d.getDay() === 0 || d.getDay() === 6) {
-    d.setDate(d.getDate() - 1);
-  }
+  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
   return d.toISOString().slice(0, 10);
 }
 
 type PeopleOption = { id: string; name: string };
+
+type Overrides = Record<string, {
+  cashEur?: number;
+  holdings?: Record<string, number>;
+  priceEurOverrides?: Record<string, number>;
+}>;
 
 export default function RebuildAdminPage() {
   const [people, setPeople] = useState<PeopleOption[]>([]);
@@ -37,9 +38,7 @@ export default function RebuildAdminPage() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
-
-  // Overrides éditables par compte
-  const [overrides, setOverrides] = useState<Record<string, { cashEur?: number; holdings?: Record<string, number> }>>({});
+  const [overrides, setOverrides] = useState<Overrides>({});
 
   useEffect(() => {
     supabase.from("people").select("id, name").then(({ data }) => {
@@ -56,7 +55,7 @@ export default function RebuildAdminPage() {
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
       setPreview(data);
-      setOverrides({}); // reset overrides quand on change de jour
+      setOverrides({});
     } catch (e: any) {
       setMsg("❌ " + e.message);
     } finally {
@@ -86,10 +85,7 @@ export default function RebuildAdminPage() {
       });
       const data = await res.json();
       if (!data.ok) throw new Error(data.error);
-
-      setMsg(`✅ Snapshot ${currentDate} écrit · NW=${fmt(data.net, 0)}€`);
-
-      // Jour suivant
+      setMsg(`✅ ${currentDate} · NW=${fmt(data.net, 0)}€`);
       const next = nextTradingDay(currentDate);
       setCurrentDate(next);
       await loadDay(next);
@@ -116,10 +112,7 @@ export default function RebuildAdminPage() {
     const n = parseFloat(value);
     setOverrides(prev => ({
       ...prev,
-      [accId]: {
-        ...prev[accId],
-        cashEur: isNaN(n) ? undefined : n,
-      },
+      [accId]: { ...prev[accId], cashEur: isNaN(n) ? undefined : n },
     }));
   };
 
@@ -129,20 +122,50 @@ export default function RebuildAdminPage() {
       ...prev,
       [accId]: {
         ...prev[accId],
-        holdings: {
-          ...(prev[accId]?.holdings || {}),
-          [ticker]: isNaN(n) ? 0 : n,
-        },
+        holdings: { ...(prev[accId]?.holdings || {}), [ticker]: isNaN(n) ? 0 : n },
       },
     }));
   };
+
+  const updatePriceOverride = (accId: string, ticker: string, value: string) => {
+    const n = parseFloat(value);
+    setOverrides(prev => ({
+      ...prev,
+      [accId]: {
+        ...prev[accId],
+        priceEurOverrides: { ...(prev[accId]?.priceEurOverrides || {}), [ticker]: isNaN(n) ? 0 : n },
+      },
+    }));
+  };
+
+  // Recalcule le total attendu avec les overrides appliqués en live
+  const computeLivePreview = () => {
+    if (!preview) return null;
+    let total = 0;
+    const perAcc: Record<string, number> = {};
+    for (const [accId, acc] of Object.entries(preview.preview) as any[]) {
+      const ov = overrides[accId] || {};
+      const cashEur = typeof ov.cashEur === "number" ? ov.cashEur : acc.cashEur;
+      let positions = 0;
+      for (const h of acc.holdings) {
+        const shares = ov.holdings?.[h.ticker] ?? h.shares;
+        const priceEur = ov.priceEurOverrides?.[h.ticker] ?? h.priceEur;
+        positions += shares * priceEur;
+      }
+      const ptf = cashEur + positions;
+      perAcc[accId] = ptf;
+      total += ptf;
+    }
+    return { total, perAcc };
+  };
+
+  const live = computeLivePreview();
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text-1)] p-6">
       <div className="max-w-[1280px] mx-auto">
         <h1 className="text-xl font-semibold mb-4">🛠 Rebuild Jour par Jour</h1>
 
-        {/* Setup */}
         <div className="card-static p-4 mb-4">
           <div className="flex gap-3 flex-wrap items-end">
             <div>
@@ -158,8 +181,7 @@ export default function RebuildAdminPage() {
               <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
                 className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-3 py-1.5 text-sm font-mono" />
             </div>
-            <button onClick={start} disabled={!personId}
-              className="btn btn-primary">
+            <button onClick={start} disabled={!personId} className="btn btn-primary">
               <Play size={12} /> Démarrer
             </button>
             {currentDate && (
@@ -171,12 +193,11 @@ export default function RebuildAdminPage() {
           {msg && <div className="mt-2 text-xs font-mono">{msg}</div>}
         </div>
 
-        {/* Navigation */}
         {currentDate && (
           <div className="card-static p-4 mb-4 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <button onClick={prev} disabled={loading || saving} className="btn btn-ghost">
-                <ChevronLeft size={12} /> Précédent
+                <ChevronLeft size={12} /> Préc.
               </button>
               <div className="text-lg font-mono font-semibold">{currentDate}</div>
               <button onClick={skip} disabled={loading || saving} className="btn btn-ghost">
@@ -185,17 +206,16 @@ export default function RebuildAdminPage() {
             </div>
             <div className="flex gap-2">
               <button onClick={() => validate(true)} disabled={loading || saving} className="btn btn-ghost text-xs">
-                Valider sans édits
+                Sans édits
               </button>
               <button onClick={() => validate(false)} disabled={loading || saving} className="btn btn-primary">
                 {saving ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
-                {saving ? "..." : "Valider + jour suivant"}
+                {saving ? "..." : "Valider + suivant"}
               </button>
             </div>
           </div>
         )}
 
-        {/* Preview */}
         {loading && (
           <div className="card-static p-8 text-center text-[var(--text-3)] font-mono text-sm">
             <Loader2 size={16} className="animate-spin inline mr-2" /> chargement...
@@ -204,36 +224,40 @@ export default function RebuildAdminPage() {
 
         {preview && !loading && (
           <>
-            {/* Résumé */}
             <div className="card-static p-4 mb-4">
-              <div className="flex items-baseline gap-4 flex-wrap">
+              <div className="flex items-baseline gap-6 flex-wrap">
                 <div>
-                  <div className="text-[10px] text-[var(--text-3)] uppercase tracking-wider">Portfolio EUR</div>
+                  <div className="text-[10px] text-[var(--text-3)] uppercase tracking-wider">Portfolio EUR (calculé)</div>
                   <div className="text-2xl font-mono font-semibold">{fmt(preview.totalPtfEur, 0)}€</div>
                 </div>
+                {live && live.total !== preview.totalPtfEur && (
+                  <div>
+                    <div className="text-[10px] text-[var(--amber)] uppercase tracking-wider">Portfolio EUR (avec édits)</div>
+                    <div className="text-2xl font-mono font-semibold text-[var(--amber)]">{fmt(live.total, 0)}€</div>
+                  </div>
+                )}
                 <div>
                   <div className="text-[10px] text-[var(--text-3)] uppercase tracking-wider">FX du jour</div>
                   <div className="font-mono">{fmt(preview.dayFx, 4)}</div>
                 </div>
                 {preview.existingSnaps?.length > 0 && (
                   <div className="text-xs text-[var(--green)] font-mono">
-                    ✓ {preview.existingSnaps.length} snapshot(s) déjà existant(s)
+                    ✓ {preview.existingSnaps.length} snapshot(s) déjà écrit(s)
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Events du jour */}
             {(preview.dayEvents.trades.length > 0 ||
               preview.dayEvents.cashMovs.length > 0 ||
               preview.dayEvents.pnls.length > 0 ||
               preview.dayEvents.dividends.length > 0) && (
               <div className="card-static p-4 mb-4">
-                <div className="text-sm font-semibold mb-2">📅 Events ce jour</div>
+                <div className="text-sm font-semibold mb-2">📅 Events du jour</div>
                 <div className="space-y-1 text-xs font-mono">
                   {preview.dayEvents.cashMovs.map((cm: any, i: number) => (
                     <div key={i} className="flex justify-between">
-                      <span>💰 CASH: {cm.description}</span>
+                      <span>💰 {cm.description}</span>
                       <span style={{ color: Number(cm.amount) >= 0 ? "var(--green)" : "var(--red)" }}>
                         {Number(cm.amount) >= 0 ? "+" : ""}{fmt(Number(cm.amount))}€
                       </span>
@@ -247,7 +271,7 @@ export default function RebuildAdminPage() {
                   ))}
                   {preview.dayEvents.pnls.map((p: any, i: number) => (
                     <div key={i} className="flex justify-between">
-                      <span>⚡ PNL: {p.description}</span>
+                      <span>⚡ {p.description}</span>
                       <span style={{ color: Number(p.amount) >= 0 ? "var(--green)" : "var(--red)" }}>
                         {Number(p.amount) >= 0 ? "+" : ""}{fmt(Number(p.amount))}€
                       </span>
@@ -263,7 +287,6 @@ export default function RebuildAdminPage() {
               </div>
             )}
 
-            {/* Par compte */}
             {Object.entries(preview.preview).map(([accId, acc]: any) => (
               <div key={accId} className="card-static p-4 mb-4">
                 <div className="flex items-baseline justify-between mb-3">
@@ -273,11 +296,10 @@ export default function RebuildAdminPage() {
                   </div>
                   <div className="font-mono text-sm">
                     <span className="text-[var(--text-3)]">Total: </span>
-                    <span className="font-semibold">{fmt(acc.ptfEur, 2)}€</span>
+                    <span className="font-semibold">{fmt(live?.perAcc[accId] ?? acc.ptfEur, 2)}€</span>
                   </div>
                 </div>
 
-                {/* Cash avec édition */}
                 <div className="mb-3 flex items-center gap-3">
                   <span className="text-xs font-mono text-[var(--text-3)] w-20">Cash (EUR)</span>
                   <input
@@ -292,7 +314,6 @@ export default function RebuildAdminPage() {
                   )}
                 </div>
 
-                {/* Holdings */}
                 {acc.holdings.length > 0 ? (
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
@@ -301,37 +322,51 @@ export default function RebuildAdminPage() {
                           <th className="text-left py-1.5 px-2">Ticker</th>
                           <th className="text-right py-1.5 px-2">Parts</th>
                           <th className="text-right py-1.5 px-2">Prix natif</th>
-                          <th className="text-right py-1.5 px-2">Prix EUR</th>
+                          <th className="text-right py-1.5 px-2">Prix EUR (éditable)</th>
                           <th className="text-right py-1.5 px-2">Valeur EUR</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {acc.holdings.map((h: any) => (
-                          <tr key={h.ticker} className="border-b border-[var(--border)]/30">
-                            <td className="py-1.5 px-2 font-mono font-semibold">
-                              {h.ticker}
-                              {!h.priceAvailable && <span className="ml-1 text-[10px] text-[var(--red)]">⚠ pas de prix</span>}
-                            </td>
-                            <td className="py-1.5 px-2 text-right">
-                              <input
-                                type="number"
-                                step="any"
-                                defaultValue={h.shares}
-                                onChange={e => updateHoldingOverride(accId, h.ticker, e.target.value)}
-                                className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-20 text-right"
-                              />
-                            </td>
-                            <td className="py-1.5 px-2 text-right font-mono text-[var(--text-3)]">
-                              {fmt(h.priceNative, 4)} {h.priceCcy}
-                            </td>
-                            <td className="py-1.5 px-2 text-right font-mono text-[var(--text-3)]">
-                              {fmt(h.priceEur, 4)}
-                            </td>
-                            <td className="py-1.5 px-2 text-right font-mono">
-                              {fmt(h.valueEur, 2)}
-                            </td>
-                          </tr>
-                        ))}
+                        {acc.holdings.map((h: any) => {
+                          const ovSh = overrides[accId]?.holdings?.[h.ticker];
+                          const ovPr = overrides[accId]?.priceEurOverrides?.[h.ticker];
+                          const effShares = ovSh ?? h.shares;
+                          const effPrice = ovPr ?? h.priceEur;
+                          const effValue = effShares * effPrice;
+                          return (
+                            <tr key={h.ticker} className="border-b border-[var(--border)]/30">
+                              <td className="py-1.5 px-2 font-mono font-semibold">
+                                {h.ticker}
+                                {!h.priceAvailable && <span className="ml-1 text-[10px] text-[var(--red)]">⚠ no price</span>}
+                              </td>
+                              <td className="py-1.5 px-2 text-right">
+                                <input
+                                  type="number" step="any"
+                                  defaultValue={h.shares}
+                                  onChange={e => updateHoldingOverride(accId, h.ticker, e.target.value)}
+                                  className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-20 text-right"
+                                />
+                              </td>
+                              <td className="py-1.5 px-2 text-right font-mono text-[var(--text-3)]">
+                                {fmt(h.priceNative, 4)} {h.priceCcy}
+                              </td>
+                              <td className="py-1.5 px-2 text-right">
+                                <input
+                                  type="number" step="any"
+                                  defaultValue={h.priceEur}
+                                  onChange={e => updatePriceOverride(accId, h.ticker, e.target.value)}
+                                  className="bg-[var(--bg-raised)] border border-[var(--border)] rounded px-1.5 py-0.5 text-xs font-mono w-24 text-right"
+                                  style={{ color: ovPr !== undefined ? "var(--amber)" : undefined }}
+                                />
+                              </td>
+                              <td className="py-1.5 px-2 text-right font-mono">
+                                <span style={{ color: (ovSh !== undefined || ovPr !== undefined) ? "var(--amber)" : undefined }}>
+                                  {fmt(effValue, 2)}
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
