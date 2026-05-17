@@ -6,9 +6,7 @@ import {
   Area, AreaChart,
 } from "recharts";
 import { supabase } from "@/lib/supabase";
-import type {
-  Account, SubAccount, Holding, BankAccount, Property, Loan, FxRate, CashMovement,
-} from "@/lib/types";
+import type { FxRate, CashMovement } from "@/lib/types";
 import { TrendingUp, Landmark, Home, CreditCard, ArrowUpRight, ArrowDownRight } from "lucide-react";
 import Sparkline from "./Sparkline";
 import GoalCard from "./GoalCard";
@@ -27,15 +25,6 @@ type NwSnapshot = {
   net: number;
 };
 
-type CategoryTotal = {
-  ccy: string;
-  stocks: number;
-  bank: number;
-  realEstate: number;
-  loans: number;
-  net: number;
-};
-
 const PERIODS = [
   { key: "7D",  label: "7j",   days: 7 },
   { key: "1M",  label: "1M",   days: 30 },
@@ -48,12 +37,6 @@ const PERIODS = [
 export default function NetWorthView({ personId }: { personId: string }) {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [subAccounts, setSubAccounts] = useState<SubAccount[]>([]);
-  const [holdings, setHoldings] = useState<Holding[]>([]);
-  const [banks, setBanks] = useState<BankAccount[]>([]);
-  const [properties, setProperties] = useState<Property[]>([]);
-  const [loans, setLoans] = useState<Loan[]>([]);
   const [fxRates, setFxRates] = useState<FxRate[]>([]);
   const [snapshots, setSnapshots] = useState<NwSnapshot[]>([]);
   const [cashMovements, setCashMovements] = useState<CashMovement[]>([]);
@@ -63,17 +46,12 @@ export default function NetWorthView({ personId }: { personId: string }) {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const { data: accs } = await supabase.from("accounts").select("*").eq("person_id", personId);
+
+    // Récupère les account_ids pour filtrer les cashMovements (utilisé par GoalCard)
+    const { data: accs } = await supabase.from("accounts").select("id").eq("person_id", personId);
     const accIds = (accs || []).map(a => a.id);
 
-    const [saR, hR, bR, pR, lR, fxR, nwR, cmR] = await Promise.all([
-      accIds.length
-        ? supabase.from("sub_accounts").select("*").in("account_id", accIds)
-        : Promise.resolve({ data: [] as any }),
-      supabase.from("holdings").select("*"),
-      supabase.from("bank_accounts").select("*").eq("person_id", personId),
-      supabase.from("properties").select("*").eq("person_id", personId),
-      supabase.from("loans").select("*").eq("person_id", personId),
+    const [fxR, nwR, cmR] = await Promise.all([
       supabase.from("fx_rates").select("*").order("date", { ascending: false }).limit(50),
       supabase.from("networth_snapshots").select("*").eq("person_id", personId)
         .eq("currency", "EUR").order("date", { ascending: true }).limit(2000),
@@ -82,12 +60,6 @@ export default function NetWorthView({ personId }: { personId: string }) {
         : Promise.resolve({ data: [] as any }),
     ]);
 
-    setAccounts((accs || []) as Account[]);
-    setSubAccounts((saR.data || []) as SubAccount[]);
-    setHoldings((hR.data || []) as Holding[]);
-    setBanks((bR.data || []) as BankAccount[]);
-    setProperties((pR.data || []) as Property[]);
-    setLoans((lR.data || []) as Loan[]);
     setFxRates((fxR.data || []) as FxRate[]);
     setSnapshots((nwR.data || []) as NwSnapshot[]);
     setCashMovements((cmR.data || []) as CashMovement[]);
@@ -96,6 +68,7 @@ export default function NetWorthView({ personId }: { personId: string }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // FX map gardée uniquement pour le footer d'info (les snapshots sont déjà en EUR)
   const fxMap = useMemo(() => {
     const m: Record<string, number> = { EUR: 1 };
     const byPair: Record<string, FxRate> = {};
@@ -108,48 +81,20 @@ export default function NetWorthView({ personId }: { personId: string }) {
     return m;
   }, [fxRates]);
 
-  const liveNw = useMemo(() => {
-    const result: Record<string, CategoryTotal> = {};
-    const bump = (ccy: string, field: keyof Omit<CategoryTotal, "ccy" | "net">, v: number) => {
-      if (!result[ccy]) result[ccy] = { ccy, stocks: 0, bank: 0, realEstate: 0, loans: 0, net: 0 };
-      result[ccy][field] += v;
-    };
-    for (const sa of subAccounts) {
-      const acc = accounts.find(a => a.id === sa.account_id);
-      if (!acc) continue;
-      bump("EUR", "stocks", Number(sa.cash || 0));
-      const subH = holdings.filter(h => h.sub_account_id === sa.id && Number(h.shares) > 0);
-      const posNative = subH.reduce((s, h) => s + Number(h.shares) * Number(h.last_price || 0), 0);
-      bump(acc.currency, "stocks", posNative);
-    }
-    for (const b of banks) bump(b.currency, "bank", Number(b.balance || 0));
-    for (const p of properties) {
-      bump(p.currency, "realEstate", Number(p.current_value || 0) * (Number(p.ownership_pct || 100) / 100));
-    }
-    for (const l of loans) bump(l.currency, "loans", Number(l.current_balance || 0));
-    for (const r of Object.values(result)) {
-      r.net = r.stocks + r.bank + r.realEstate - r.loans;
-    }
-    return Object.values(result).sort((a, b) => b.net - a.net);
-  }, [subAccounts, accounts, holdings, banks, properties, loans]);
+  // ★ SOURCE DE VÉRITÉ : dernier networth_snapshot (déjà en EUR consolidé)
+  const latestSnap = useMemo(() => {
+    if (snapshots.length === 0) return null;
+    return snapshots[snapshots.length - 1];
+  }, [snapshots]);
 
-  const grandTotalEur = useMemo(() => {
-    let total = 0;
-    for (const r of liveNw) total += r.net * (fxMap[r.ccy] || 1);
-    return total;
-  }, [liveNw, fxMap]);
+  const totalsEur = useMemo(() => ({
+    stocks:     Number(latestSnap?.stocks || 0),
+    bank:       Number(latestSnap?.bank || 0),
+    realEstate: Number(latestSnap?.real_estate || 0),
+    loans:      Number(latestSnap?.loans || 0),
+  }), [latestSnap]);
 
-  const totalsEur = useMemo(() => {
-    const t = { stocks: 0, bank: 0, realEstate: 0, loans: 0 };
-    for (const r of liveNw) {
-      const fx = fxMap[r.ccy] || 1;
-      t.stocks += r.stocks * fx;
-      t.bank += r.bank * fx;
-      t.realEstate += r.realEstate * fx;
-      t.loans += r.loans * fx;
-    }
-    return t;
-  }, [liveNw, fxMap]);
+  const grandTotalEur = Number(latestSnap?.net || 0);
 
   const sparkSeries = useMemo(() => {
     const last30 = snapshots.slice(-30);
@@ -203,15 +148,15 @@ export default function NetWorthView({ personId }: { personId: string }) {
     return <div className="flex items-center justify-center py-24"><span className="font-mono text-[var(--text-3)] text-sm">loading...</span></div>;
   }
 
-  const isEmpty = liveNw.length === 0;
+  const isEmpty = !latestSnap;
 
   return (
     <div className="px-5 py-6 max-w-[1280px] mx-auto">
       {toast && <div className="fixed top-3 right-3 z-50 bg-[var(--green)] text-white py-2 px-4 rounded-md text-xs font-mono animate-fade-up shadow-lg">{toast}</div>}
       {isEmpty ? (
         <div className="card-static py-24 text-center">
-          <div className="text-[var(--text-2)] text-sm mb-1">Rien à afficher pour l&apos;instant</div>
-          <div className="text-[var(--text-3)] text-xs font-mono">Ajoute des données dans Stocks, Banque, Immo ou Dettes</div>
+          <div className="text-[var(--text-2)] text-sm mb-1">Pas encore de snapshot patrimoine</div>
+          <div className="text-[var(--text-3)] text-xs font-mono">Lance un update sur l&apos;onglet Stocks pour générer le premier</div>
         </div>
       ) : (
         <>
@@ -249,9 +194,12 @@ export default function NetWorthView({ personId }: { personId: string }) {
                 <span className="ml-1.5">sur {PERIODS.find(p => p.key === period)?.label.toLowerCase()}</span>
               </div>
             )}
+            <div className="text-[10px] text-[var(--text-4)] font-mono mt-1.5">
+              dernier snapshot · {latestSnap?.date}
+            </div>
           </div>
 
-          {/* ★ GOAL CARD — reçoit maintenant les cashMovements pour calculer la perf pure */}
+          {/* ★ GOAL CARD */}
           <GoalCard
             personId={personId}
             currentNet={grandTotalEur}
@@ -392,52 +340,11 @@ export default function NetWorthView({ personId }: { personId: string }) {
             })()}
           </div>
 
-          {/* Détail par devise */}
-          {liveNw.length > 1 && (
-            <div className="card-static overflow-hidden mb-4">
-              <div className="px-5 py-3 border-b border-[var(--border)]">
-                <span className="text-sm font-semibold text-[var(--text-1)]">Détail par devise</span>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-[12px]">
-                  <thead>
-                    <tr className="border-b border-[var(--border)]">
-                      {["Devise", "Actions", "Banque", "Immo", "Dettes", "Net", "≈ EUR"].map((h, i) => (
-                        <th key={h} className={`py-2.5 px-4 text-[var(--text-3)] font-medium text-[10px] uppercase tracking-wider ${i === 0 ? "text-left" : "text-right"}`}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {liveNw.map(r => {
-                      const fx = fxMap[r.ccy] || 1;
-                      const netEur = r.net * fx;
-                      return (
-                        <tr key={r.ccy} className="row-hover border-b border-[var(--border)] last:border-0">
-                          <td className="py-3 px-4 font-mono font-semibold text-[var(--text-1)]">{r.ccy}</td>
-                          <td className="py-3 px-4 font-mono text-right text-[var(--text-2)]">{r.stocks !== 0 ? fmt(r.stocks, 0) : "—"}</td>
-                          <td className="py-3 px-4 font-mono text-right text-[var(--text-2)]">{r.bank !== 0 ? fmt(r.bank, 0) : "—"}</td>
-                          <td className="py-3 px-4 font-mono text-right text-[var(--text-2)]">{r.realEstate !== 0 ? fmt(r.realEstate, 0) : "—"}</td>
-                          <td className="py-3 px-4 font-mono text-right" style={{ color: r.loans > 0 ? "var(--red)" : undefined }}>
-                            {r.loans !== 0 ? `−${fmt(r.loans, 0)}` : "—"}
-                          </td>
-                          <td className="py-3 px-4 font-mono font-semibold text-right text-[var(--text-1)]">
-                            {fmt(r.net, 0)} {r.ccy}
-                          </td>
-                          <td className="py-3 px-4 font-mono text-right text-[var(--text-3)] text-[11px]">
-                            {r.ccy === "EUR" ? "—" : `${fmt(netEur, 0)}€`}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+          {Object.keys(fxMap).length > 1 && (
+            <div className="text-[10px] text-[var(--text-4)] font-mono text-center">
+              {Object.entries(fxMap).filter(([k]) => k !== "EUR").map(([k, v]) => `1 ${k} = ${fmt(v, 4)}€`).join(" · ")}
             </div>
           )}
-
-          <div className="text-[10px] text-[var(--text-4)] font-mono text-center">
-            {Object.entries(fxMap).filter(([k]) => k !== "EUR").map(([k, v]) => `1 ${k} = ${fmt(v, 4)}€`).join(" · ")}
-          </div>
         </>
       )}
     </div>
